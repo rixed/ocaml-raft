@@ -1,0 +1,3 @@
+description = "Raft protocol toy implementation"
+version = "1"
+requires = "batteries"

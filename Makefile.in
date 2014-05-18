@@ -1,0 +1,39 @@
+top_srcdir = @top_srcdir@
+
+PKG_NAME = raft
+SOURCES  = \
+	raft_intf.ml \
+	raft_impl.ml
+
+EXAMPLES_BYTE =
+
+REQUIRES = batteries
+
+EXAMPLES_OPT = $(EXAMPLES_BYTE:.byte=.opt)
+EXAMPLES = $(EXAMPLES_BYTE) $(EXAMPLES_OPT)
+
+SYNTAX =
+
+.PHONY: all loc
+all: $(XARCHIVE) examples
+
+include $(top_srcdir)/make.common
+
+opt: $(XARCHIVE)
+
+examples: $(XARCHIVE) $(EXAMPLES_OPT)
+$(EXAMPLES_BYTE): $(ARCHIVE)
+$(EXAMPLES_OPT): $(XARCHIVE)
+
+check.byte: $(ARCHIVE)
+check.opt: $(XARCHIVE)
+check-spec: check.byte
+	@./check.byte || echo "custom checks FAILED"
+
+clean-spec:
+
+dep-spec:
+
+loc:
+	@ls *.ml *.mli -1 | xargs cat | wc -l
+
