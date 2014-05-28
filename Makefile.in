@@ -3,11 +3,12 @@ top_srcdir = @top_srcdir@
 PKG_NAME = raft
 SOURCES  = \
 	raft_intf.ml \
-	raft_impl.ml
+	rpc.ml \
+	raft.ml
 
 EXAMPLES_BYTE =
 
-REQUIRES = batteries
+REQUIRES = batteries oUnit
 
 EXAMPLES_OPT = $(EXAMPLES_BYTE:.byte=.opt)
 EXAMPLES = $(EXAMPLES_BYTE) $(EXAMPLES_OPT)
@@ -28,7 +29,7 @@ $(EXAMPLES_OPT): $(XARCHIVE)
 check.byte: $(ARCHIVE)
 check.opt: $(XARCHIVE)
 check-spec: check.byte
-	@./check.byte || echo "custom checks FAILED"
+	@./check.byte || echo "======================\ncustom checks FAILED!!\n======================"
 
 clean-spec:
 

@@ -5,8 +5,8 @@ OCAMLDEP   = @OCAMLFIND@ ocamldep
 OCAMLDOC   = @OCAMLFIND@ ocamldoc -html -colorize-code -all-params
 OCAMLMKTOP = @OCAMLFIND@ ocamlmktop -g
 QTEST      = qtest
-override OCAMLOPTFLAGS += $(INCS) -w Ael -g -annot -I $(top_srcdir) -inline 9
-override OCAMLFLAGS    += $(INCS) -w Ael -g -annot -I $(top_srcdir)
+override OCAMLOPTFLAGS += $(INCS) -w Ael-31-40-42-44-45 -g -annot -I $(top_srcdir) -inline 9
+override OCAMLFLAGS    += $(INCS) -w Ael-31-40-42-44-45 -g -annot -I $(top_srcdir)
 CAMLINCLUDE = $(shell @OCAMLFIND@ printconf stdlib)
 override CPPFLAGS      += @CPPFLAGS@ -I @prefix@/include -I $(CAMLINCLUDE) -I $(top_srcdir) -D_GNU_SOURCE
 override CFLAGS        += @CFLAGS@ -O2 -std=c99 -W -Wall
