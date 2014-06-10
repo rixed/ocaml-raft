@@ -2,6 +2,8 @@ top_srcdir = @top_srcdir@
 
 PKG_NAME = raft
 SOURCES  = \
+	log.ml \
+	event.ml \
 	raft_intf.ml \
 	rpc.ml \
 	raft.ml
@@ -29,7 +31,7 @@ $(EXAMPLES_OPT): $(XARCHIVE)
 check.byte: $(ARCHIVE)
 check.opt: $(XARCHIVE)
 check-spec: check.byte
-	@./check.byte || echo "======================\ncustom checks FAILED!!\n======================"
+	@./check.byte || echo -e "======================\ncustom checks FAILED!!\n======================"
 
 clean-spec:
 

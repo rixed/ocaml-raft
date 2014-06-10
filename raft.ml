@@ -5,10 +5,19 @@ type host_id = int
 type term_id = int
 type log_index = int (* first index is 1 *)
 
-module type COMMAND = sig type t end
+module type COMMAND = sig
+    type t (* the type of a command for the state machine *)
+    type state (* the type of the value of the state machine, aka apply return value *)
+end
 
-(* Implementation of a RAFT server *)
-module Base (RPC_Maker : RPC.S) (Command : COMMAND) =
+module RPC_ClientServer_Types (Command : COMMAND) =
+struct
+    type arg = Command.t
+    type ret = Ok of log_index * Command.state
+             | Redirect of host_id
+end
+
+module Server (RPC_Maker : RPC.S) (Command : COMMAND) =
 struct
     type log_entry =
         { command : Command.t (* command for the state machine *) ;
@@ -19,6 +28,7 @@ struct
           mutable logs : log_entry list (* FIXME: a resizeable array for uncommitted and committed entries *) ;
           mutable commit_index : log_index (* index of highest log entry known to be committed *) ;
           mutable last_applied : log_index (* index of highest log entry known to be applied to state machine *) ;
+          mutable last_state : Command.state option (* last apply result *) ;
           (* for the leader: *)
           next_index : (host_id, log_index * log_index) Hashtbl.t
             (* index of the next log entry and highest log entry known to be replicated on each server
@@ -30,6 +40,7 @@ struct
           logs = [] ;
           commit_index = 0 ;
           last_applied = 0 ;
+          last_state = None ;
           next_index = Hashtbl.create 9 }
 
     (* since we are going to try many logs implementation: *)
@@ -37,7 +48,7 @@ struct
     let log_at t idx =
         List.at t.logs (idx - 1 (* first index is 1 *))
 
-    module RPC_Types =
+    module RPC_Server_Types =
     struct
         (* There is only two RPCs *)
         module RequestVote =
@@ -66,20 +77,16 @@ struct
               success : bool (* did candidate received the vote? /
                                     follower already contained entry matching prev_log_{index,term} *) }
     end
-    module RPC = RPC_Maker (RPC_Types)
-end
+    module RPC_Servers = RPC_Maker (RPC_Server_Types)
+    module RPC_ClientServers = RPC_Maker (RPC_ClientServer_Types (Command))
 
-module Server (RPC_Maker : RPC.S) (Command : COMMAND) =
-struct
-    include Base (RPC_Maker) (Command)
-    
     let answer t success =
-        { RPC_Types.term = t.current_term ; RPC_Types.success = success }
+        { RPC_Server_Types.term = t.current_term ; RPC_Server_Types.success = success }
 
     let request_vote t arg =
-        let open RPC_Types.RequestVote in
+        let open RPC_Server_Types.RequestVote in
         (* Reply false if term < current_term *)
-        if arg.RPC_Types.RequestVote.term < t.current_term then answer t false else
+        if arg.RPC_Server_Types.RequestVote.term < t.current_term then answer t false else
         (* If voted_for is None or candidate_id, and candidate's log is at least as up-to-date
          * as receiver's log, grant vote *)
         let grant =
@@ -89,9 +96,9 @@ struct
         answer t grant
 
     let append_entries t apply arg =
-        let open RPC_Types.AppendEntries in
+        let open RPC_Server_Types.AppendEntries in
         (* Reply false if term < currentTerm *)
-        if arg.RPC_Types.AppendEntries.term < t.current_term then answer t false else
+        if arg.RPC_Server_Types.AppendEntries.term < t.current_term then answer t false else
         (* Reply false if log doesn't contain an entry at prev_log_index whose term matches prev_log_term,
          * If an existing entry conflicts with a new one (same index but different terms),                 
          * delete the existing entry and all that follow it *)
@@ -121,29 +128,62 @@ struct
                     )
                 ) in
         let success, new_logs = aux [] 1 (Array.to_list arg.entries) t.logs in
-        if not success then answer t false else (
+        if not success then answer t false
+        else (
             let new_commit_index =
                 if arg.leader_commit > t.commit_index then
                     min arg.leader_commit (List.length new_logs)
                 else t.commit_index in
             t.logs <- new_logs ;
             (* Apply all the new commands *)
-            for idx = t.commit_index + 1 to new_commit_index do
-                apply (log_at t idx)
-            done ;
             t.commit_index <- new_commit_index ;
-            (* TODO: what are we supposed to do with t.last_applied?? *)
+            while t.last_applied < t.commit_index do
+                t.last_applied <- t.last_applied + 1 ;
+                t.last_state <- Some (apply (log_at t t.last_applied))
+            done ;
             answer t true
+        )
+
+    let convert_to_follower _t =
+        failwith "TODO"
+    let convert_to_candidate _t =
+        failwith "TODO"
+
+    let may_become_follower t peer_term =
+        if peer_term > t.current_term then (
+            t.current_term <- peer_term ;
+            convert_to_follower t
         )
 
     let serve apply =
         let t = init () in
-        RPC.serve (function
-        | RequestVote arg -> request_vote t arg
-        | AppendEntries arg -> append_entries t apply arg)
+        RPC_ClientServers.serve (function
+            | _cmd ->
+                (* Leaders: if command received from client: append entry to local log,
+                 * then issues AppendEntries in parallel to each of the other servers to
+                 * replicate the entry. When the entry has been safely replicated the leader
+                 * applies the entry tp its state machine and returns the result of that
+                 * execution to the client. *)
+                failwith "TODO") ;
+        RPC_Servers.serve (function
+            | RequestVote arg ->
+                may_become_follower t arg.RPC_Server_Types.RequestVote.term ;
+                request_vote t arg
+            | AppendEntries arg ->
+                may_become_follower t arg.RPC_Server_Types.AppendEntries.term ;
+                append_entries t apply arg)
+end
 
-    (* We also have RPCs from clients to raft servers to append Command or read the state of the state machine;
-     * which reading operation should probably be a command so that we read it at a given location in time,
-     * after previous commands are applied - and that's the application of the read command that triggers
-     * the response to the client. *)
+(* We also have RPCs from clients to raft servers to append Commands.
+ * Every command has a result (the result given by the apply function.
+ * So answer to clients are delayed until actual application. Which
+ * probably mean that the answer does not necessarily come from the same
+ * server than the one we submitted the command to.
+ * So the easier is: when we submit a command we get as the result the
+ * log index of the command, and we also can pull the current state of
+ * the state machine with its corresponding id, waiting for id > the one that
+ * have previously been returned *)
+module Client (RPC_Maker : RPC.S) (Command : COMMAND) =
+struct
+    module RPC_ClientServers = RPC_Maker (RPC_ClientServer_Types (Command))
 end
