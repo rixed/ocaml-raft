@@ -31,10 +31,9 @@ struct
                 Log.debug "Serving string.length for str='%s'" s ;
                 SrvT.Write (String.length s) |> w in
         stop_listening := Srv.serve service_port server ;
-        let send = Clt.client "localhost" service_port (fun w res ->
+        let send = Clt.client "localhost" service_port (fun _w res ->
             match res with
-            | CltT.EndOfFile ->
-                w CltT.Close
+            | CltT.EndOfFile -> () (* we already closed at the beginning *)
             | CltT.Value l ->
                 if l = String.length tests.(!idx) then incr oks ;
                 incr idx) in

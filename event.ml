@@ -84,26 +84,26 @@ struct
         Buffer.clear buf ;
         Buffer.add_substring buf str sz (String.length str - sz)
 
+    type todo = Nope | ToDo | Done (* for deferred closes *)
     let try_read_value fd buf value_cb writer handler close_out closed_in =
         (* Append what can be read from fd into buf ;
            notice that if more than 1500 bytes are available
            then the event loop will call us again at once *)
         let str = String.create 1500 in
         let sz = Unix.read fd str 0 (String.length str) in
-        Log.debug "Read %d bytes" sz ;
+        Log.debug "Read %d bytes from file" sz ;
         if sz = 0 then (
-            Log.debug "Closing infd" ;
-            Unix.(shutdown fd SHUTDOWN_RECEIVE) ;
+            Log.debug "infd is closed by peer" ;
             closed_in := true ;
             value_cb writer T.EndOfFile ;
-            if close_out = 2 then unregister handler
+            if close_out = Done then unregister handler
         ) else (
             Buffer.add_substring buf str 0 sz ;
             (* Read one value, apply value_cb to it, then returns the offset of next value.
              * Beware that we may have 0, 1 or more values in rbuf *)
             let rec read_next content ofs =
                 let len = String.length content - ofs in
-                Log.debug "still %d bytes to read" len ;
+                Log.debug "Still %d bytes to read from buffer" len ;
                 (* If we have no room for Marshal header then it's too early to read anything *)
                 if len < Marshal.header_size then ofs else
                 let value_len = Marshal.header_size + Marshal.data_size content ofs in
@@ -124,19 +124,19 @@ struct
     let start infd outfd value_cb =
         let inbuf = Buffer.create 2000
         and outbuf = Buffer.create 2000
-        and close_out = ref 0 and closed_in = ref false in
+        and close_out = ref Nope and closed_in = ref false in
         let writer = function
             | T.Write v ->
                 Log.debug "writing value '%a' to buffer" T.print_t_write v ;
                 Marshal.to_string v [] |>
                 Buffer.add_string outbuf
             | T.Close ->
-                assert (!close_out = 0) ;
-                close_out := 1 in
+                assert (!close_out = Nope) ;
+                close_out := ToDo in
         let buffer_is_empty b = Buffer.length b = 0 in
         let register_files (rfiles, wfiles, efiles) =
             infd :: rfiles,
-            (if buffer_is_empty outbuf && !close_out <> 1 then wfiles else outfd :: wfiles),
+            (if buffer_is_empty outbuf && !close_out <> ToDo then wfiles else outfd :: wfiles),
             efiles in
         let process_files handler (rfiles, wfiles, _) =
             if List.mem infd rfiles then
@@ -144,10 +144,10 @@ struct
             if List.mem outfd wfiles then (
                 if not (buffer_is_empty outbuf) then
                     try_write_buf outbuf outfd ;
-                if !close_out = 1 then (
+                if !close_out = ToDo then (
                     Log.debug "Closing outfd" ;
                     Unix.(shutdown outfd SHUTDOWN_SEND) ;
-                    close_out := 2 ;
+                    close_out := Done ;
                     if !closed_in then unregister handler
                 )
             ) in
