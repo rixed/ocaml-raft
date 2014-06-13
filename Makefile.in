@@ -28,6 +28,11 @@ examples: $(XARCHIVE) $(EXAMPLES_OPT)
 $(EXAMPLES_BYTE): $(ARCHIVE)
 $(EXAMPLES_OPT): $(XARCHIVE)
 
+raft.top: $(ARCHIVE)
+	$(OCAMLMKTOP) -o $@ -package "findlib,$(REQUIRES)" -linkpkg $(ARCHIVE)
+run: raft.top
+	rlwrap ./raft.top -init raft.init
+
 check.byte: $(ARCHIVE)
 check.opt: $(XARCHIVE)
 check-spec: check.byte
