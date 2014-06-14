@@ -25,8 +25,7 @@ let select_once handlers =
         let ll = List.length in let l (a,b,c) = ll a + ll b + ll c in
         if debug then Log.debug "selected %d files out of %d" (l changed_files) (l (rfiles,wfiles,efiles)) ;
         process_all_monitored_files handlers changed_files
-    with
-        | Unix_error (EINTR,_,_) -> ()
+    with Unix_error (EINTR,_,_) -> ()
 
 let handlers = ref []
 
@@ -38,6 +37,11 @@ let loop () =
 let register handler =
     handlers := handler :: !handlers ;
     if debug then Log.debug "Registering a new handler, now got %d" (List.length !handlers)
+
+let register_timeout f =
+    let handler = { register_files = identity ;
+                    process_files = fun handler _files -> f handler } in
+    register handler
 
 let unregister handler =
     handlers := List.filter ((!=) handler) !handlers ;
@@ -52,14 +56,14 @@ end
 module type IOType =
 sig
     include BaseIOType
-    type read_result = Value of t_read | EndOfFile
+    type read_result = Value of t_read | Timeout | EndOfFile
     type write_cmd = Write of t_write | Close
 end
 
 module MakeIOType (B : BaseIOType) : IOType with type t_read = B.t_read and type t_write = B.t_write =
 struct
     include B
-    type read_result = Value of t_read | EndOfFile
+    type read_result = Value of t_read | Timeout | EndOfFile
     type write_cmd = Write of t_write | Close
 end
 
@@ -84,7 +88,8 @@ struct
         Buffer.add_substring buf str sz (String.length str - sz)
 
     type todo = Nope | ToDo | Done (* for deferred closes *)
-    let try_read_value fd buf value_cb writer handler close_out closed_in =
+    (* return true if we should close fd *)
+    let try_read_value fd buf value_cb writer =
         (* Append what can be read from fd into buf ;
            notice that if more than 1500 bytes are available
            then the event loop will call us again at once *)
@@ -92,10 +97,8 @@ struct
         let sz = Unix.read fd str 0 (String.length str) in
         if debug then Log.debug "Read %d bytes from file" sz ;
         if sz = 0 then (
-            if debug then Log.debug "infd is closed by peer" ;
-            closed_in := true ;
             value_cb writer T.EndOfFile ;
-            if close_out = Done then unregister handler
+            true
         ) else (
             Buffer.add_substring buf str 0 sz ;
             (* Read one value, apply value_cb to it, then returns the offset of next value.
@@ -117,6 +120,7 @@ struct
             Buffer.clear buf ;
             let ofs = read_next content 0 in
             Buffer.add_substring buf content ofs (String.length content - ofs) ;
+            false
         )
 
     let start ?timeout infd outfd value_cb =
@@ -127,37 +131,46 @@ struct
         let inbuf = Buffer.create 2000
         and outbuf = Buffer.create 2000
         and close_out = ref Nope and closed_in = ref false in
-        let writer = function
+        let writer c =
+            assert (!close_out <> Done) ; (* otherwise why were we been given the possibility to write? *)
+            match c with
             | T.Write v ->
                 Marshal.to_string v [] |>
                 Buffer.add_string outbuf
             | T.Close ->
-                assert (!close_out = Nope) ;
-                close_out := ToDo in
+                if !close_out = Nope then close_out := ToDo in
         let writer = reset_timeout_and writer in
         let buffer_is_empty b = Buffer.length b = 0 in
         let register_files (rfiles, wfiles, efiles) =
-            infd :: rfiles,
-            (if buffer_is_empty outbuf && !close_out <> ToDo then wfiles else outfd :: wfiles),
+            (if !closed_in then rfiles else infd :: rfiles),
+            (if !close_out <> Done && not (buffer_is_empty outbuf) then outfd :: wfiles else wfiles),
             efiles in
         let process_files handler (rfiles, wfiles, _) =
-            if List.mem infd rfiles then
-                try_read_value infd inbuf (reset_timeout_and value_cb) writer handler !close_out closed_in ;
+            if List.mem infd rfiles then (
+                assert (not !closed_in) ; (* otherwise we were not in the select fileset *)
+                if try_read_value infd inbuf (reset_timeout_and value_cb) writer then (
+                    if debug then Log.debug "infd is closed by peer" ;
+                    closed_in := true ;
+                    if infd <> outfd then (
+                        if debug then Log.debug "Closing infd" ;
+                        Unix.close infd
+                    ) else (
+                        assert (!close_out <> Done) ;
+                        close_out := ToDo))) ;
             if List.mem outfd wfiles then (
                 if not (buffer_is_empty outbuf) then
                     try_write_buf outbuf outfd) ;
             Option.may (fun timeout ->
-                if Unix.time() -. !last_used > timeout then (
-                    (* Pretend we received an EndOfFile *)
-                    if not !closed_in then (
-                        Unix.(shutdown infd SHUTDOWN_RECEIVE) ;
-                        value_cb writer T.EndOfFile ;
-                        closed_in := true)))
+                let now = Unix.time () in
+                if now -. !last_used > timeout then (
+                    last_used := now ; (* reset timeout *)
+                    value_cb writer Timeout))
                 timeout ;
             if !close_out = ToDo then (
                 if debug then Log.debug "Closing outfd" ;
-                Unix.(shutdown outfd SHUTDOWN_SEND) ;
+                Unix.close outfd ;
                 close_out := Done ;
+                if infd = outfd then closed_in := true ;
                 if !closed_in then unregister handler)
             in
         register { register_files ; process_files } ;

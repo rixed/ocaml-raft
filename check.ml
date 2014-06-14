@@ -22,6 +22,7 @@ struct
         let service_port = "31142" in
         let stop_listening = ref ignore in
         let server w = function
+            | SrvT.Timeout
             | SrvT.EndOfFile ->
                 w SrvT.Close ;
                 !stop_listening ()
@@ -31,6 +32,7 @@ struct
         stop_listening := Srv.serve service_port server ;
         let send = Clt.client "localhost" service_port (fun _w res ->
             match res with
+            | CltT.Timeout
             | CltT.EndOfFile -> () (* we already closed at the beginning *)
             | CltT.Value l ->
                 OUnit2.assert_equal l (String.length tests.(!idx)) ;
@@ -41,7 +43,7 @@ end
 
 (* Check RPCs *)
 
-module RPC_Checks (RPC_Maker : RPC.S) =
+module RPC_Checks (RPC_Maker : RPC.Maker) =
 struct
     module RPC_Types =
     struct
@@ -50,19 +52,21 @@ struct
     end
     module RPC = RPC_Maker (RPC_Types)
 
+    let host = Host.make "localhost" "21743"
+
     let () =
         let f (a, b) = String.of_int (a+b) in
-        RPC.serve f
+        RPC.serve host f
 
     let checks () =
-        RPC.call (0, 1) (fun r ->
+        RPC.call host (0, 1) (fun r ->
             Log.debug "Test RPC(0,1)" ;
             OUnit2.assert_equal r (Ok "1")) ;
-        RPC.call (2, 3) (fun r ->
+        RPC.call host (2, 3) (fun r ->
             Log.debug "Test RPC(2,3)" ;
             OUnit2.assert_equal r (Ok "5") ;
             (* And we can call an RPC from an answer *)
-            RPC.call (4, 5) (fun r ->
+            RPC.call host (4, 5) (fun r ->
                 Log.debug "Test RPC(4,5)" ;
                 OUnit2.assert_equal r (Ok "9")))
 end

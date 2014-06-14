@@ -2,20 +2,22 @@ open Batteries
 open Raft_intf
 
 (* not remote RPC, ie call function directly *)
-module Local : RPC.S = functor (Types : RPC.TYPES) ->
+module Local (Types : RPC.TYPES) : RPC.S with module Types = Types =
 struct
+    module Types = Types
     type rpc_res = Ok of Types.ret
                  | Err of string
 
-    let server = ref None
+    let servers = Hashtbl.create 3
 
-    let call a k =
-        match !server with
+    let call h a k =
+        match Hashtbl.find_option servers h with
         | None -> k (Err "no server")
         | Some srv -> k (Ok (srv a))
 
-    let serve f =
-        server := Some f
+    let serve h f =
+        Log.debug "Set RPC.Local server" ;
+        Hashtbl.add servers h f
 end
 
 (* RPC through TCP *)
@@ -24,20 +26,18 @@ module type TCP_CONFIG =
 sig
     val timeout : float option
     val max_accepted : int option
-    val service_port : string
-    val server_name : string
 end
 
 module DefaultTcpConfig : TCP_CONFIG =
 struct
     let timeout = None
     let max_accepted = None
-    let service_port = "27481"
-    let server_name = "localhost"
 end
 
-module Tcp (Config : TCP_CONFIG) : RPC.S = functor (Types : RPC.TYPES) ->
+module Tcp (Config : TCP_CONFIG) (Types : RPC.TYPES) : RPC.S with module Types = Types =
 struct
+    module Types = Types
+
     type rpc_res = Ok of Types.ret
                  | Err of string
 
@@ -53,12 +53,12 @@ struct
 
     open Config
 
-    let serve f =
-        let _shutdown = TcpServer.serve ?timeout ?max_accepted service_port (fun write input ->
-            let res = match input with
-                | Srv_IOType.Value (id, v) -> Srv_IOType.Write (id, f v)
-                | Srv_IOType.EndOfFile -> Srv_IOType.Close in
-            write res) in
+    let serve h f =
+        let _shutdown = TcpServer.serve ?timeout ?max_accepted h.Host.port (fun write input ->
+            match input with
+            | Srv_IOType.Value (id, v) -> write (Srv_IOType.Write (id, f v))
+            | Srv_IOType.Timeout
+            | Srv_IOType.EndOfFile -> write Srv_IOType.Close) in
         () (* we keep serving until we die *)
 
     module Clt_IOType = Event.MakeIOTypeRev(BaseIOType)
@@ -78,16 +78,17 @@ struct
         let n = ref 0 in
         fun () -> incr n ; !n
 
-    let call v k =
+    let call h v k =
         if !cnx_writer = None then
             (* connect to the server *)
-            cnx_writer := Some (TcpClient.client ?timeout server_name service_port (fun write input ->
+            cnx_writer := Some (TcpClient.client ?timeout h.Host.name h.Host.port (fun write input ->
                 match input with
                 | Clt_IOType.Value (id, v) ->
                     Hashtbl.modify_opt id (function
                         | None -> failwith "TODO"
                         | Some k -> k (Ok v) ; None)
                         continuations ;
+                | Clt_IOType.Timeout
                 | Clt_IOType.EndOfFile ->
                     (* notify all continuations *)
                     Hashtbl.iter (fun _id k ->
