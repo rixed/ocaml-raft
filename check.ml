@@ -9,9 +9,7 @@ struct
     module BaseIOType =
     struct
         type t_write = string
-        let print_t_write = String.print
         type t_read = int
-        let print_t_read = Int.print
     end
     (* We simulate a 'string-length' service: client sends string and read their length *)
     module CltT = Event.MakeIOType (BaseIOType)
@@ -19,7 +17,7 @@ struct
     module Clt = Event.TcpClient (CltT)
     module Srv = Event.TcpServer (SrvT)
     let checks () =
-        let oks = ref 0 and idx = ref 0 in
+        let idx = ref 0 in
         let tests = [| "hello" ; "glop" ; "" |] in
         let service_port = "31142" in
         let stop_listening = ref ignore in
@@ -35,34 +33,49 @@ struct
             match res with
             | CltT.EndOfFile -> () (* we already closed at the beginning *)
             | CltT.Value l ->
-                if l = String.length tests.(!idx) then incr oks ;
+                OUnit2.assert_equal l (String.length tests.(!idx)) ;
                 incr idx) in
         Array.iter (fun s -> send (CltT.Write s)) tests ;
-        send CltT.Close;
-        Event.loop () ;
-        OUnit2.assert_equal !oks (Array.length tests)
+        send CltT.Close
 end
 
 (* Check RPCs *)
 
-module RPC_Checks =
+module RPC_Checks (RPC_Maker : RPC.S) =
 struct
     module RPC_Types =
     struct
         type arg = int * int
         type ret = string
     end
-    module RPC = Rpc.Local(RPC_Types)
+    module RPC = RPC_Maker (RPC_Types)
 
     let () =
         let f (a, b) = String.of_int (a+b) in
         RPC.serve f
 
     let checks () =
-        RPC.call (1, 2) (fun r -> OUnit2.assert_equal r (Ok "3"))
+        RPC.call (0, 1) (fun r ->
+            Log.debug "Test RPC(0,1)" ;
+            OUnit2.assert_equal r (Ok "1")) ;
+        RPC.call (2, 3) (fun r ->
+            Log.debug "Test RPC(2,3)" ;
+            OUnit2.assert_equal r (Ok "5") ;
+            (* And we can call an RPC from an answer *)
+            RPC.call (4, 5) (fun r ->
+                Log.debug "Test RPC(4,5)" ;
+                OUnit2.assert_equal r (Ok "9")))
 end
 
 let () =
-    RPC_Checks.checks () ;
-    Tcp_Checks.checks ()
+    let module R = RPC_Checks(Rpc.Local) in R.checks () ;
+    let module TcpConfig =
+        struct
+            include Rpc.DefaultTcpConfig
+            let timeout = Some 0.2
+            let max_accepted = Some 1
+        end in
+    let module R = RPC_Checks(Rpc.Tcp(TcpConfig)) in R.checks () ;
+    Tcp_Checks.checks () ;
+    Event.loop ()
 

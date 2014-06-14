@@ -1,6 +1,8 @@
 open Batteries
 type fd = Unix.file_descr
 
+let debug = false
+
 type monitored_files = fd list (* readables *)
                      * fd list (* writables *)
                      * fd list (* exceptional conditions *)
@@ -18,9 +20,10 @@ let select_once handlers =
 
     let open Unix in
     let rfiles, wfiles, efiles = collect_all_monitored_files handlers in
-    try let changed_files = select rfiles wfiles efiles (-1.) in
+    (* Notice: we timeout the select after 1s so that handlers have a chance to implement timeouting *)
+    try let changed_files = select rfiles wfiles efiles 1. in
         let ll = List.length in let l (a,b,c) = ll a + ll b + ll c in
-        Log.debug "selected %d files out of %d" (l changed_files) (l (rfiles,wfiles,efiles)) ;
+        if debug then Log.debug "selected %d files out of %d" (l changed_files) (l (rfiles,wfiles,efiles)) ;
         process_all_monitored_files handlers changed_files
     with
         | Unix_error (EINTR,_,_) -> ()
@@ -28,24 +31,22 @@ let select_once handlers =
 let handlers = ref []
 
 let loop () =
-    Log.debug "Entering event loop" ;
+    if debug then Log.debug "Entering event loop" ;
     while !handlers != [] do
         select_once !handlers
     done
 let register handler =
     handlers := handler :: !handlers ;
-    Log.debug "Registering a new handler, now got %d" (List.length !handlers)
+    if debug then Log.debug "Registering a new handler, now got %d" (List.length !handlers)
 
 let unregister handler =
     handlers := List.filter ((!=) handler) !handlers ;
-    Log.debug "Unregistering a handler, now got %d" (List.length !handlers)
+    if debug then Log.debug "Unregistering a handler, now got %d" (List.length !handlers)
 
 module type BaseIOType =
 sig
     type t_read
     type t_write
-    val print_t_write : 'a BatInnerIO.output -> t_write -> unit
-    val print_t_read  : 'a BatInnerIO.output -> t_read  -> unit
 end
 
 module type IOType =
@@ -68,8 +69,6 @@ struct
     struct
         type t_read = B.t_write
         type t_write = B.t_read
-        let print_t_write = B.print_t_read
-        let print_t_read = B.print_t_write
     end
     include MakeIOType (BaseIOTypeRev)
 end
@@ -79,7 +78,7 @@ module BufferedIO (T : IOType) =
 struct
     let try_write_buf buf fd =
         let str = Buffer.contents buf in
-        Log.debug "writing %d bytes ('%s')" (String.length str) str ;
+        if debug then Log.debug "writing %d bytes ('%s')" (String.length str) str ;
         let sz = Unix.single_write fd str 0 (String.length str) in
         Buffer.clear buf ;
         Buffer.add_substring buf str sz (String.length str - sz)
@@ -91,9 +90,9 @@ struct
            then the event loop will call us again at once *)
         let str = String.create 1500 in
         let sz = Unix.read fd str 0 (String.length str) in
-        Log.debug "Read %d bytes from file" sz ;
+        if debug then Log.debug "Read %d bytes from file" sz ;
         if sz = 0 then (
-            Log.debug "infd is closed by peer" ;
+            if debug then Log.debug "infd is closed by peer" ;
             closed_in := true ;
             value_cb writer T.EndOfFile ;
             if close_out = Done then unregister handler
@@ -103,7 +102,7 @@ struct
              * Beware that we may have 0, 1 or more values in rbuf *)
             let rec read_next content ofs =
                 let len = String.length content - ofs in
-                Log.debug "Still %d bytes to read from buffer" len ;
+                if debug then Log.debug "Still %d bytes to read from buffer" len ;
                 (* If we have no room for Marshal header then it's too early to read anything *)
                 if len < Marshal.header_size then ofs else
                 let value_len = Marshal.header_size + Marshal.data_size content ofs in
@@ -111,7 +110,6 @@ struct
                     (* Otherwise use this header to find out data size
                      * Note: data size does not include header size *)
                     let v : T.t_read = Marshal.from_string content ofs in
-                    Log.debug "Read an actual value: '%a'" T.print_t_read v ;
                     value_cb writer (T.Value v) ;
                     read_next content (ofs + value_len)
                 ) in
@@ -121,18 +119,22 @@ struct
             Buffer.add_substring buf content ofs (String.length content - ofs) ;
         )
 
-    let start infd outfd value_cb =
+    let start ?timeout infd outfd value_cb =
+        let last_used = ref 0. in (* for timeouting *)
+        let reset_timeout_and f x =
+            last_used := Unix.time () ;
+            f x in
         let inbuf = Buffer.create 2000
         and outbuf = Buffer.create 2000
         and close_out = ref Nope and closed_in = ref false in
         let writer = function
             | T.Write v ->
-                Log.debug "writing value '%a' to buffer" T.print_t_write v ;
                 Marshal.to_string v [] |>
                 Buffer.add_string outbuf
             | T.Close ->
                 assert (!close_out = Nope) ;
                 close_out := ToDo in
+        let writer = reset_timeout_and writer in
         let buffer_is_empty b = Buffer.length b = 0 in
         let register_files (rfiles, wfiles, efiles) =
             infd :: rfiles,
@@ -140,17 +142,24 @@ struct
             efiles in
         let process_files handler (rfiles, wfiles, _) =
             if List.mem infd rfiles then
-                try_read_value infd inbuf value_cb writer handler !close_out closed_in ;
+                try_read_value infd inbuf (reset_timeout_and value_cb) writer handler !close_out closed_in ;
             if List.mem outfd wfiles then (
                 if not (buffer_is_empty outbuf) then
-                    try_write_buf outbuf outfd ;
-                if !close_out = ToDo then (
-                    Log.debug "Closing outfd" ;
-                    Unix.(shutdown outfd SHUTDOWN_SEND) ;
-                    close_out := Done ;
-                    if !closed_in then unregister handler
-                )
-            ) in
+                    try_write_buf outbuf outfd) ;
+            Option.may (fun timeout ->
+                if Unix.time() -. !last_used > timeout then (
+                    (* Pretend we received an EndOfFile *)
+                    if not !closed_in then (
+                        Unix.(shutdown infd SHUTDOWN_RECEIVE) ;
+                        value_cb writer T.EndOfFile ;
+                        closed_in := true)))
+                timeout ;
+            if !close_out = ToDo then (
+                if debug then Log.debug "Closing outfd" ;
+                Unix.(shutdown outfd SHUTDOWN_SEND) ;
+                close_out := Done ;
+                if !closed_in then unregister handler)
+            in
         register { register_files ; process_files } ;
         (* Return the writer function *)
         writer
@@ -162,9 +171,11 @@ sig
      * function. The returned value is the writer function.
      * Notice that the reader is a callback, so this is different (and more complex) than the function call
      * abstraction. The advantage is that the main thread can do a remote call and proceed to something else
-     * instead of being forced to wait for the response (event driven design). This also allow 0 or more than
-     * 1 return values. *)
-    val client : string -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (T.write_cmd -> unit)
+     * instead of being forced to wait for the response (event driven design). This also allows 0 or more than
+     * 1 return values.
+     * When timeouting, [reader] will be called with [EndOfFile] and input stream will be closed. You must
+     * still close output stream if you want to close the socket for good. *)
+    val client : ?timeout:float -> string -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (T.write_cmd -> unit)
 end =
 struct
     module BIO = BufferedIO (T)
@@ -173,17 +184,17 @@ struct
         let open Unix in
         getaddrinfo host service [AI_SOCKTYPE SOCK_STREAM ; AI_CANONNAME ] |>
         List.find_map (fun ai ->
-            Log.debug "Trying to connect to %s:%s" ai.ai_canonname service ;
+            if debug then Log.debug "Trying to connect to %s:%s" ai.ai_canonname service ;
             try let sock = socket ai.ai_family ai.ai_socktype ai.ai_protocol in
                 Unix.connect sock ai.ai_addr ;
                 Some sock
             with exn ->
-                Log.debug "Cannot connect: %s" (Printexc.to_string exn) ;
+                if debug then Log.debug "Cannot connect: %s" (Printexc.to_string exn) ;
                 None)
 
-    let client host service buf_reader =
+    let client ?timeout host service buf_reader =
         try let fd = connect host service in
-            BIO.start fd fd buf_reader
+            BIO.start ?timeout fd fd buf_reader
         with Not_found ->
             failwith ("Cannot connect to "^ host ^":"^ service)
 end
@@ -192,7 +203,7 @@ module TcpServer (T : IOType) :
 sig
     (* [serve service callback] listen on port [service] and serve each query with [callback].
      * A shutdown function is returned that will stop the server from accepting new connections. *)
-    val serve : string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (unit -> unit)
+    val serve : ?timeout:float -> ?max_accepted:int -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (unit -> unit)
 end =
 struct
     module BIO = BufferedIO (T)
@@ -201,32 +212,41 @@ struct
         let open Unix in
         match getaddrinfo "" service [AI_SOCKTYPE SOCK_STREAM; AI_PASSIVE;] with
         | ai::_ ->
-            Log.debug "Listening on %s" service ;
+            if debug then Log.debug "Listening on %s" service ;
             let sock = socket PF_INET SOCK_STREAM 0 in
-            Unix.bind sock ai.ai_addr ;
-            Unix.listen sock 5 ;
+            setsockopt sock SO_REUSEADDR true ;
+            setsockopt sock SO_KEEPALIVE true ;
+            bind sock ai.ai_addr ;
+            listen sock 5 ;
             sock
         | [] ->
             failwith ("Cannot listen to "^ service)
 
-    let serve service value_cb =
+    let serve ?timeout ?max_accepted service value_cb =
+        let accepted = ref 0 in
+        Option.may (fun n -> assert (n > 0)) max_accepted ;
         let listen_fd = listen service in
+        let rec stop_listening () =
+            if debug then Log.debug "Closing listening socket" ;
+            Unix.close listen_fd ;
+            unregister handler
         (* We need a special kind of event handler to handle the listener fd:
          * one that accept when it's readable and that never write. *)
-        let register_files (rfiles, wfiles, efiles) =
+        and register_files (rfiles, wfiles, efiles) =
             listen_fd :: rfiles, wfiles, efiles
         and process_files _handler (rfiles, _, _) =
             if List.mem listen_fd rfiles then (
-                Log.debug "Reading a SYN, accepting cnx" ;
+                if debug then Log.debug "Reading a SYN, accepting cnx" ;
                 let client_fd, _sock_addr = Unix.accept listen_fd in
-                let _buf_writer = BIO.start client_fd client_fd value_cb in
+                incr accepted ;
+                (match max_accepted with
+                    | Some n when !accepted >= n -> stop_listening ()
+                    | _ -> ()) ;
+                let _buf_writer = BIO.start ?timeout client_fd client_fd value_cb in
                 ()
-            ) in
-        let handler = { register_files ; process_files } in
+            )
+        and handler = { register_files ; process_files } in
         register handler ;
-        fun () ->
-            Log.debug "Closing listening socket" ;
-            Unix.close listen_fd ;
-            unregister handler
+        stop_listening
 end
 

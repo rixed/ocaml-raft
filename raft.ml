@@ -139,7 +139,7 @@ struct
             t.commit_index <- new_commit_index ;
             while t.last_applied < t.commit_index do
                 t.last_applied <- t.last_applied + 1 ;
-                t.last_state <- Some (apply (log_at t t.last_applied))
+                t.last_state <- Some (apply (log_at t t.last_applied).command)
             done ;
             answer t true
         )
