@@ -3,9 +3,9 @@
 module Host =
 struct
     type t = { name : string ;
-               port : string }
+               port : int }
     let make name port = { name ; port }
-    let to_string t = t.name ^":"^ t.port
+    let to_string t = t.name ^":"^ string_of_int t.port
 end
 
 module RPC =

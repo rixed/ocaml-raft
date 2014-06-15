@@ -33,12 +33,12 @@ raft.top: $(ARCHIVE)
 run: raft.top
 	rlwrap ./raft.top -init raft.init
 
-TEST_PROGRAMS = check.ml raft_check.ml
+TEST_PROGRAMS = raft_check.ml
 check.cmo: $(ARCHIVE)
 raft_check.cmo: $(ARCHIVE)
 check-spec: $(TEST_PROGRAMS:.ml=.byte)
 	@for p in $^ ; do \
-	  ./$$p && echo "$$p OK" || echo "\n     XXXXX $$p FAILED!! XXXXX\n" ;\
+	  ./$$p && echo "$$p OK" || (echo ; echo "     XXXXX $$p FAILED!! XXXXX" ; echo) ;\
 	done
 
 clean-spec:

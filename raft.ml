@@ -1,8 +1,20 @@
 open Batteries
 open Raft_intf
 
+module L = Log.Debug
+
 type term_id = int
 type log_index = int (* first index is 1 *)
+
+let election_timeout = 0.225
+let election_timeout_spray = 0.333
+let heartbeat_timeout = 0.1
+let random_election_timeout () =
+    let s = election_timeout_spray in
+    let r = Random.float (s*.2.) -. s +. 1. in
+    assert (r > 0.) ;
+    election_timeout *. r
+
 
 module type COMMAND = sig
     type t (* the type of a command for the state machine *)
@@ -10,41 +22,56 @@ module type COMMAND = sig
 end
 
 (* We build both client and server from the same RPC_Maker and COMMAND so that type
- * correctness is enforced *and* we can actually use Rpc.Local *)
+ * correctness is enforced (a bit more) *)
 module Make (RPC_Maker : RPC.Maker) (Command : COMMAND) =
 struct
+
+    type log_entry =
+        { command : Command.t (* command for the state machine *) ;
+          term : term_id (* when it was received *) }
+
+    type peer_info = { mutable next_index : log_index (* index of the next log entry to send there *) ;
+                       mutable match_index : log_index (* index of highest log entry known to be replicated there *) ;
+                       mutable last_sent : float (* when we last sent entries there *) }
+
+    type leader_t = (Host.t, peer_info) Hashtbl.t
+    type state = Follower | Candidate | Leader of leader_t
+
+    let string_of_state = function
+        | Follower -> Log.colored false 4 "Follower"
+        | Candidate -> Log.colored true 4 "Candidate"
+        | Leader _ -> Log.colored true 7 "Leader"
+
+    type server =
+        { mutable state : state (* The state I'm currently in *) ;
+          host : Host.t (* myself *) ;
+          peers : Host.t list (* other servers *) ;
+          mutable current_term : term_id (* latest term server has seen (initialized to 0 at startup, increases monotonically) *) ;
+          mutable voted_for : Host.t option (* candidate that received vote in current term (if any) *) ;
+          mutable logs : log_entry list (* FIXME: a resizeable array like BatDynArray for uncommitted and committed entries *) ;
+          mutable commit_index : log_index (* index of highest log entry known to be committed *) ;
+          mutable last_applied : log_index (* index of highest log entry known to be applied to state machine *) ;
+          mutable last_state : Command.state option (* last apply result *) ;
+          mutable last_leader : Host.t (* last leader we heard from *) ;
+          mutable last_recvd_from_leader : float (* when we last heard from a leader *) ;
+          mutable election_timeout : float }
 
     (* Same RPC_ClientServers for both Server and Client *)
     module RPC_ClientServer_Types =
     struct
-        type arg = Command.t
-        type ret = State of log_index * Command.state
-                 | Redirect of Host.t
+        type arg = ChangeState of Command.t
+                 | QueryInfo (* to a specific host *)
+        type ret = State of log_index * Command.state (* to a ChangeState only *)
+                 | Redirect of Host.t (* to a ChangeState only *)
+                 | Info of server (* to a QueryInfo only *)
     end
     module RPC_ClientServers = RPC_Maker (RPC_ClientServer_Types)
 
     module Server =
     struct
-        type log_entry =
-            { command : Command.t (* command for the state machine *) ;
-              term : term_id (* when it was received *) }
-
-        type leader_t = { next_index : (Host.t, log_index * log_index) Hashtbl.t
-                (* index of the next log entry and highest log entry known to be replicated on each server
-                 * (initialized to leader last log_index + 1) *) }
-        type state = Follower | Candidate | Leader of leader_t
-        type t =
-            { mutable state : state (* The state I'm currently in *) ;
-              host : Host.t (* myself *) ;
-              peers : Host.t list (* other servers *) ;
-              mutable current_term : term_id (* latest term server has seen (initialized to 0 at startup, increases monotonically) *) ;
-              mutable voted_for : Host.t option (* candidate that received vote in current term (if any) *) ;
-              mutable logs : log_entry list (* FIXME: a resizeable array for uncommitted and committed entries *) ;
-              mutable commit_index : log_index (* index of highest log entry known to be committed *) ;
-              mutable last_applied : log_index (* index of highest log entry known to be applied to state machine *) ;
-              mutable last_state : Command.state option (* last apply result *) ;
-              mutable last_leader : Host.t (* last leader we heard from *) ;
-              mutable last_recvd_from_leader : float (* when we last heard from a leader *) }
+        type t = server
+        let print fmt t =
+            Printf.fprintf fmt "%20s@%s, term=%d" (string_of_state t.state) (Host.to_string t.host) t.current_term
 
         module RPC_Server_Types =
         struct
@@ -77,8 +104,17 @@ struct
         end
         module RPC_Servers = RPC_Maker (RPC_Server_Types)
 
+        let print_arg fmt = function
+            | RPC_Server_Types.RequestVote rv ->
+                Printf.fprintf fmt "RequestVote(term=%d,last_log_index=%d,last_log_term=%d)"
+                    rv.term rv.last_log_index rv.last_log_term
+            | RPC_Server_Types.AppendEntries ae ->
+                let open RPC_Server_Types.AppendEntries in
+                Printf.fprintf fmt "AppendEntries(nb_entries=%d)" (Array.length ae.entries)
+
         let init_follower host peers =
             { state = Follower ;
+              election_timeout = random_election_timeout () ;
               current_term = 0 ;
               host ; peers ;
               voted_for = None ;
@@ -87,7 +123,7 @@ struct
               last_applied = 0 ;
               last_state = None ;
               last_leader = host ; (* no better idea *)
-              last_recvd_from_leader = Unix.time () }
+              last_recvd_from_leader = Unix.gettimeofday () }
 
         let iter_peers t f =
             List.iter f t.peers
@@ -98,7 +134,7 @@ struct
         (* raises Invalid_argument all kind of exception if idx is bogus *)
         let log_at logs idx =
             List.at logs (idx - 1 (* first index is 1 *))
-        (* Append a new log entry and return it's index *)
+        (* Append a new log entry and return last one's index *)
         let log_append t entries =
             t.logs <- t.logs @ entries ;
             List.length t.logs (* first index is 1 *)
@@ -106,50 +142,78 @@ struct
             List.length logs
 
         let reset_election_timeout t =
-            t.last_recvd_from_leader <- Unix.time ()
+            let now = Unix.gettimeofday () in
+            L.debug "%a: Resetting election timeout to %a" print t Log.date now ;
+            t.last_recvd_from_leader <- now
             
         let convert_to_follower t =
-            Log.debug "Srv@%s: Converting to Follower" (Host.to_string t.host) ;
-            reset_election_timeout t ;
-            failwith "TODO"
+            L.debug "%a: Converting to Follower" print t ;
+            t.state <- Follower ;
+            t.election_timeout <- random_election_timeout () ;
+            reset_election_timeout t
 
         (* Wrapper that handles common behavior *)
         let call_server t peer arg k =
+            L.debug "%a: Calling %s for %a" print t (Host.to_string peer) print_arg arg ;
             RPC_Servers.call peer arg (fun res ->
                 (match res with
                 | Ok res ->
-                    if res.RPC_Server_Types.term > t.current_term then (
+                    if res.term > t.current_term then (
                         t.current_term <- res.term ;
+                        t.voted_for <- None ;
                         convert_to_follower t
                     )
                 | Err err ->
-                    Log.debug "Srv@%s: Received Error %s" (Host.to_string t.host) err) ;
+                    L.debug "%a: Received Error %s" print t err) ;
                 k res)
 
-        let answer t success =
+        let answer ?dest ?reason t success =
+            L.debug "%a: Answering %s%s%s"
+                print t (if success then (Log.colored true 2 "YES") else (Log.colored false 1 "NO"))
+                (match dest with Some d -> " to "^ Host.to_string d | None -> "")
+                (match reason with Some r -> " because "^r | None -> "") ;
             { RPC_Server_Types.term = t.current_term ; RPC_Server_Types.success = success }
 
         let answer_request_vote t arg =
             let open RPC_Server_Types.RequestVote in
-            (* Reply false if term < current_term *)
-            if arg.RPC_Server_Types.RequestVote.term < t.current_term then answer t false else
-            (* If voted_for is None or candidate_id, and candidate's log is at least as up-to-date
-             * as receiver's log, grant vote *)
-            let grant =
-                (t.voted_for = None || t.voted_for = Some arg.candidate_id) &&
-                arg.last_log_index >= List.length t.logs &&
-                arg.last_log_term >= t.current_term in
-            answer t grant
+            let grant, reason =
+                (* Reply false if term < current_term *)
+                if arg.term < t.current_term then false, "he is from the past" else
+                (* If voted_for is None or candidate_id, and candidate's log is at least as up-to-date
+                 * as receiver's log, grant vote. *)
+                match t.voted_for with Some guy when guy <> arg.candidate_id ->
+                      false, "I vote for "^(Host.to_string guy)
+                | _ ->
+                (* Up-to-date: If the logs have last entries with different terms, then the log with
+                 * the later term is more up to date. If the logs end with the same term, then whichever
+                 * log is longer is more up-to-date. *)
+                let last_log_index = log_last_index t.logs in
+                let last_log_term =
+                    if last_log_index > 0 then
+                        let last_log = log_at t.logs last_log_index in
+                        last_log.term
+                    else 0 in
+                if last_log_term > arg.last_log_term then
+                    false, "his last log is too old" else
+                if last_log_term < arg.last_log_term then
+                    true, "his last log is from the future" else
+                if last_log_index > arg.last_log_index then
+                    false, "I have more logs" else
+                (* TODO: I vote for a candidate with same log than me, is that correct? *)
+                true, "he has more logs or same" in
+            if grant then t.voted_for <- Some arg.candidate_id ;
+            answer ~dest:arg.candidate_id ~reason t grant
 
         (* Used by followers *)
         let answer_append_entries t apply arg =
             assert (t.state = Follower) ;
+            reset_election_timeout t ;
             let open RPC_Server_Types.AppendEntries in
             (* Reply false if term < currentTerm *)
-            if arg.term < t.current_term then answer t false else
+            if arg.term < t.current_term then answer ~dest:arg.leader_id ~reason:"Too old to be a leader" t false else
             (* Reply false if log doesn't contain an entry at prev_log_index whose term matches prev_log_term *)
             if arg.prev_log_index > 0 && (let log = log_at t.logs arg.prev_log_index in log.term) <> arg.prev_log_term then (
-                answer t false
+                answer ~dest:arg.leader_id ~reason:"logs looks dubious" t false
             ) else
             (* If an existing entry conflicts with a new one (same index but different terms),                 
              * delete the existing entry and all that follow it *)
@@ -179,7 +243,7 @@ struct
                         )
                     ) in
             let success, new_logs = aux [] 1 (Array.to_list arg.entries) t.logs in
-            if not success then answer t false
+            if not success then answer ~dest:arg.leader_id t false
             else (
                 t.last_leader <- arg.RPC_Server_Types.AppendEntries.leader_id ;
                 let new_commit_index =
@@ -193,52 +257,61 @@ struct
                     t.last_applied <- t.last_applied + 1 ;
                     t.last_state <- Some (apply (log_at t.logs t.last_applied).command)
                 done ;
-                answer t true
+                answer ~dest:arg.leader_id t true
             )
 
         (* Send the entries to every other peers *)
-        let append_entries t entries k =
+        let append_entries t peers_info entries peers k =
+            if entries = [] && peers = [] then () else
             let new_idx = log_append t entries in
-            assert (new_idx > 0) ;
             let arg =
                 let open RPC_Server_Types.AppendEntries in
                 let prev_log_term =
                     if new_idx > 1 then (
                         let prev_log = log_at t.logs (new_idx-1) in
                         prev_log.term
-                    ) else -1 in
+                    ) else 0 in
                 { term = t.current_term ;
                   leader_id = t.host ;
                   prev_log_index = new_idx-1 ;
                   prev_log_term ;
                   entries = Array.of_list entries ;
                   leader_commit = t.commit_index } in
-            iter_peers t (fun peer ->
-                Log.debug "Srv@%s: Send an AppendEntries (with %d entry) to follower %s:%s" (Host.to_string t.host) (List.length entries) peer.name peer.port ;
-                call_server t peer (RPC_Server_Types.AppendEntries arg) k)
+            let now = Unix.gettimeofday () in
+            List.iter (fun peer ->
+                Hashtbl.modify_opt peer (function
+                    | None -> (* create this info *)
+                        Some { next_index = new_idx+1 ;
+                               match_index = 0 ;
+                               last_sent = now }
+                    | Some info as x ->
+                        info.last_sent <- now ;
+                        x) peers_info ;
+                call_server t peer (RPC_Server_Types.AppendEntries arg) k) peers
 
         let convert_to_leader t =
-            Log.debug "Srv@%s: Converting to Leader" (Host.to_string t.host) ;
+            L.debug "%a: Converting to Leader" print t ;
             assert (t.state = Candidate) ;
-            let next_index = Hashtbl.create (List.length t.peers) in
-            List.iter (fun p ->
-                Hashtbl.add next_index p (0, 0))
-                t.peers ; (* FIXME: how to init this, really? *)
-            t.state <- Leader { next_index } ;
-            append_entries t [] ignore (* just to say hello *)
+            let peers_info = Hashtbl.create (List.length t.peers) in
+            t.state <- Leader peers_info ;
+            append_entries t peers_info [] t.peers ignore (* will fill peers_info *)
 
         let convert_to_candidate t =
-            Log.debug "Srv@%s: Converting to Candidate" (Host.to_string t.host) ;
+            L.debug "%a: Converting to Candidate" print t ;
             assert (t.state = Follower || t.state = Candidate) ;
             t.current_term <- t.current_term + 1 ;
+            t.voted_for <- Some t.host ; (* I vote for myself (see below) *)
             t.state <- Candidate ;
+            t.election_timeout <- random_election_timeout () ;
             reset_election_timeout t ;
             (* Request a vote *)
-            let nb_wins = ref 1 (* I vote for myself *) in
+            let nb_wins = ref 1 (* I vote for myself (see above) *) in
             let last_log_index = log_last_index t.logs in
             let last_log_term =
-                let last_log = log_at t.logs last_log_index in
-                last_log.term in
+                if last_log_index > 0 then
+                    let last_log = log_at t.logs last_log_index in
+                    last_log.term
+                else 0 in
             let term = t.current_term in (* we save current_term so that we know when to discard answers *)
             iter_peers t (fun peer ->
                 let open RPC_Server_Types.RequestVote in
@@ -247,75 +320,93 @@ struct
                 call_server t peer (RequestVote arg) (function
                     | Ok res ->
                         if res.success &&
-                           res.term = term &&
-                           t.current_term = term && (* I'm still candidate for *this* election *)
-                           t.state = Candidate (* Which guarantee we won't enter here again once win *)
+                           res.term = term
                         then (
                             incr nb_wins ;
-                            if !nb_wins > nb_peers t / 2 then convert_to_leader t
-                        )
+                            L.debug "%a: got %d wins" print t !nb_wins ;
+                        ) else L.debug "%a: still only %d wins" print t !nb_wins ;
+                        if t.state = Candidate && (* I'm still candidate *)
+                           t.current_term = term && (* for *this* election *)
+                           !nb_wins > nb_peers t / 2
+                        then convert_to_leader t
                     | Err _err -> ()))
 
         let may_become_follower t peer_term =
-            if peer_term >= t.current_term then (
-                if peer_term > t.current_term then (
-                    Log.debug "Srv@%s: Resetting current_term with peer's of %d" (Host.to_string t.host) peer_term ;
-                    t.current_term <- peer_term
-                ) ;
+            if peer_term > t.current_term then (
+                L.debug "%a: Resetting current_term with peer's of %d" print t peer_term ;
+                t.current_term <- peer_term ;
+                t.voted_for <- None ;
                 convert_to_follower t
             )
 
-        let may_send_heartbeat lt now =
-            ignore lt ;
-            ignore now ;
-            failwith "TODO"
 
-        let serve ?(election_timeout=3.) host peers apply =
-            let t = init_follower host peers in
+        let may_send_heartbeat t peers_info now =
+            (* Send a heartbeat to every other hosts which I haven't sent anything for too long *)
+            let old_peers = Hashtbl.fold (fun peer info lst ->
+                if now -. info.last_sent > heartbeat_timeout then peer::lst else lst)
+                peers_info [] in
+            append_entries t peers_info [] old_peers ignore (* just to say hello *)
+
+        let serve pub_host peers apply =
+            (* the raft host listen on next port compared to public host *)
+            let to_raft (h : Host.t) = { h with port = h.port + 1 } in
+            let raft_host = to_raft pub_host in
+            let raft_peers = List.map to_raft peers in
+            let t = init_follower raft_host raft_peers in
             (* Add a timeout function *)
             Event.register_timeout (fun _handler ->
-                let now = Unix.time () in
+                let now = Unix.gettimeofday () in
+                let time_isolated = now -. t.last_recvd_from_leader in
                 match t.state with
                 | Follower ->
-                    if now -. t.last_recvd_from_leader > election_timeout then
+                    if time_isolated > t.election_timeout then (
+                        L.debug "%a: Timeouting (isolated for %gs)" print t time_isolated ;
                         convert_to_candidate t
+                    )
                 | Candidate ->
-                    if now -. t.last_recvd_from_leader > election_timeout then
-                        (* TODO: contermeasure for repeated split votes, Cf 5.2 *)
+                    if time_isolated > t.election_timeout then (
+                        L.debug "%a: Timeouting (isolated for %gs)" print t time_isolated ;
                         convert_to_candidate t
-                | Leader lt ->
-                    may_send_heartbeat lt now
+                    )
+                | Leader peers_info ->
+                    may_send_heartbeat t peers_info now
             ) ;
-            RPC_ClientServers.serve host (fun command ->
-                (match t.state with
-                | Leader _ ->
-                    (* Leaders: if command received from client: append entry to local log, *)
-                    let new_entry = { command ; term = t.current_term } in
-                    (* ...then issues AppendEntries in parallel to each of the other servers to
-                     * replicate the entry. *)
-                    (* TODO: send only this entry? *)
-                    let nb_res = ref 0 in
-                    append_entries t [new_entry] (fun _res ->
-                        incr nb_res ;
-                        Log.debug "Srv@%s: Received %d answers from followers" (Host.to_string t.host) !nb_res) ;
-                    (* TODO: This is my understanding that we cannot serve anything else until this query is answered *)
-                    while !nb_res < nb_peers t do
-                        Unix.sleep 1 (* FIXME: condvar *)
-                    done ;
-                    (* When the entry has been safely replicated the leader
-                     * applies the entry to its state machine and returns the result of that
-                     * execution to the client. *)
-                    let res = apply command in
-                    State (List.length t.logs, res)
-                | _ ->
-                    Log.debug "Srv@%s: Received a command while I'm not the leader, redirecting to %s" (Host.to_string t.host) (Host.to_string t.last_leader) ;
-                    Redirect t.last_leader)) ;
-            RPC_Servers.serve host (function
+            RPC_ClientServers.serve pub_host (function
+                | ChangeState command ->
+                    (match t.state with
+                    | Leader peers_info ->
+                        (* Leaders: if command received from client: append entry to local log, *)
+                        let new_entry = { command ; term = t.current_term } in
+                        (* ...then issues AppendEntries in parallel to each of the other servers to
+                         * replicate the entry. *)
+                        (* TODO: send only this entry? *)
+                        let nb_res = ref 0 in
+                        append_entries t peers_info [new_entry] t.peers (fun _res ->
+                            incr nb_res ;
+                            L.debug "%a: Received %d answers from followers" print t !nb_res) ;
+                        (* TODO: This is my understanding that we cannot serve anything else until this query is answered *)
+                        while !nb_res < nb_peers t do
+                            Unix.sleep 1 (* FIXME: condvar *)
+                        done ;
+                        (* When the entry has been safely replicated the leader
+                         * applies the entry to its state machine and returns the result of that
+                         * execution to the client. *)
+                        let res = apply command in
+                        State (List.length t.logs, res)
+                    | _ ->
+                        L.debug "%a: Received a command while I'm not the leader, redirecting to %s" print t (Host.to_string t.last_leader) ;
+                        Redirect t.last_leader)
+                | QueryInfo -> Info t) ;
+            RPC_Servers.serve raft_host (function
                 | RequestVote arg ->
-                    may_become_follower t arg.RPC_Server_Types.RequestVote.term ;
+                    let open RPC_Server_Types.RequestVote in
+                    may_become_follower t arg.term ;
                     answer_request_vote t arg
                 | AppendEntries arg ->
-                    may_become_follower t arg.RPC_Server_Types.AppendEntries.term ;
+                    let open RPC_Server_Types.AppendEntries in
+                    may_become_follower t arg.term ;
+                    if t.state = Candidate && arg.term = t.current_term then
+                        convert_to_follower t ;
                     answer_append_entries t apply arg)
     end
 
@@ -330,25 +421,48 @@ struct
      * have previously been returned *)
     module Client =
     struct
-        let call ?(max_nb_try=5) servers x k =
-            let rec retry nb_try leader =
+        type t = { servers : Host.t array ; (* List of all known servers *)
+                   mutable leader : Host.t (* the one believed to be good *) }
+
+        let random_leader servers = servers.(Random.int (Array.length servers))
+
+        let make servers =
+            { servers ; leader = random_leader servers }
+
+        let max_nb_try = 5
+
+        let info _t host k =
+            RPC_ClientServers.call host QueryInfo (function
+                | Ok (Info info) -> k info
+                | Ok _ ->
+                    L.debug "Clt: server %s answering with state not infos" (Host.to_string host)
+                | Err x ->
+                    L.debug "Clt: Can't get infos from %s: %s" (Host.to_string host) x)
+
+        let call t x k =
+            let rec retry nb_try =
                 if nb_try > max_nb_try then failwith "Too many retries" ;
-                RPC_ClientServers.call leader x (function
+                RPC_ClientServers.call t.leader (ChangeState x) (function
                     | Ok (State (_log_index, state)) ->
                         k state
                     | Ok (Redirect leader') ->
-                        Log.debug "Clt: Was told to redirect to %s" (Host.to_string leader') ;
-                        let leader' =
-                            if leader' <> leader then leader' else (
+                        L.debug "Clt: Was told to redirect to %s" (Host.to_string leader') ;
+                        t.leader <-
+                            if leader' <> t.leader then leader' else (
                                 (* The server do not know who is the leader yet, try another one *)
-                                servers.(Random.int (Array.length servers))
-                            ) in
-                        retry (nb_try+1) leader'
-                    | Err _ ->
+                                (* TODO: but the same one! *)
+                                random_leader t.servers
+                            ) ;
+                        retry (nb_try+1)
+                    | Ok (Info t) ->
+                        L.debug "Clt: server %s sending its status out of the blue?" (Host.to_string t.host) ;
+                        assert false (* TODO *)
+                    | Err x ->
+                        L.debug "Clt: Can't get state from %s: %s" (Host.to_string t.leader) x ;
                         (* try another server? *)
-                        let leader' = servers.(Random.int (Array.length servers)) in
-                        retry (nb_try+1) leader')
+                        t.leader <- random_leader t.servers ;
+                        retry (nb_try+1))
             in
-            retry 0 servers.(0)
+            retry 0
     end
 end

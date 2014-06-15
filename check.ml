@@ -52,7 +52,7 @@ struct
     end
     module RPC = RPC_Maker (RPC_Types)
 
-    let host = Host.make "localhost" "21743"
+    let host = Host.make "localhost" 21743
 
     let () =
         let f (a, b) = String.of_int (a+b) in
@@ -72,14 +72,13 @@ struct
 end
 
 let () =
-    let module R = RPC_Checks(Rpc.Local) in R.checks () ;
     let module TcpConfig =
         struct
             include Rpc.DefaultTcpConfig
             let timeout = Some 0.2
             let max_accepted = Some 1
         end in
-    let module R = RPC_Checks(Rpc.Tcp(TcpConfig)) in R.checks () ;
+    let module R = RPC_Checks(Rpc.Tcp(TcpConfigForTests)) in R.checks () ;
     Tcp_Checks.checks () ;
     Event.loop ()
 

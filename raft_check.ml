@@ -29,7 +29,7 @@ struct
     type state = int
 end
 
-module Raft_impl = Raft.Make (Rpc.Local) (Command)
+module Raft_impl = Raft.Make (Rpc.Tcp (Rpc.DefaultTcpConfig)) (Command)
 
 module TestServer =
 struct
@@ -45,17 +45,32 @@ struct
         Raft_impl.Server.serve host others StateMachine.apply
 end
 
-module TestClient =
-struct
-    let call h x k = Raft_impl.Client.call h x k
-end
+module TestClient = Raft_impl.Client
 
 let main =
-    let servers = Array.init 5 (fun _ -> Host.make "localhost" (string_of_int (Random.int 32768 + 1024))) in
+    let servers = Array.init 5 (fun _ -> Host.make "localhost" (Random.int 64510 + 1024)) in
     Array.iter (fun s ->
         (* peers = list of all servers but s *)
         let peers = Array.fold_left (fun lst h -> if h = s then lst else h::lst) [] servers in
         TestServer.serve s peers)
         servers ;
-    TestClient.call servers 1 (fun r -> OUnit2.assert_equal r 1)
+    let client = TestClient.make servers in
+    (* Give the server a head start and make sure they elected a leader after 2*election_timeout *)
+    let et = Raft.election_timeout in
+    Event.pause (2. *. et) (fun () ->
+        (* Check there is only one leader *)
+        (* We do this by sending a special 'dump' RPC to each servers (it works because we run this
+         * in 'stopped clock' mode) *)
+        let nb_leaders = ref 0 and nb_answers = ref 0 in
+        Array.iter (fun s ->
+            TestClient.info client s (fun info ->
+                incr nb_answers ;
+                (match info.state with Leader _ -> incr nb_leaders | _ -> ())))
+            servers ;
+        (* wait until all responded *)
+        Event.until (fun () -> !nb_answers = Array.length servers)
+            (fun () ->
+                OUnit2.assert_equal !nb_leaders 1 ;
+                Event.clear ())) ;
+    Event.loop ~timeout:(0.1 *. et) ()
 
