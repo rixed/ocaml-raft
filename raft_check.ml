@@ -73,10 +73,18 @@ let main =
             (fun () -> !nb_answers = Array.length servers)
             (fun () -> OUnit2.assert_equal !nb_leaders 1 ; incr nb_tests) ;
         Event.pause (3. *. et) (fun () ->
+            let do_test i _o =
+                Log.info "Sending %d..." i ;
+                TestClient.call client i (fun r ->
+                    Log.info "Sent %d, got %d" i r ;
+                    (*OUnit2.assert_equal r o ;*)
+                    incr nb_tests) in
             (* Apart from that, start perturbing the raft servers by sending some commands to the state machine *)
-            TestClient.call client 1 (fun r -> OUnit2.assert_equal r 1 ; incr nb_tests))) ;
+            do_test 1 1 ;
+            do_test 2 6 ;
+            do_test 3 27)) ;
     Event.condition
-        (fun () -> !nb_tests >= 2)
+        (fun () -> !nb_tests = 4)
         (fun () -> Event.clear ()) ;
     Event.loop ~timeout:(0.1 *. et) ()
 

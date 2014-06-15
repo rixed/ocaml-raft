@@ -9,12 +9,16 @@ type log_index = int (* first index is 1 *)
 let election_timeout = 0.225
 let election_timeout_spray = 0.333
 let heartbeat_timeout = 0.1
+let nodelay_replication = false (* true for replicating each command as they are received *)
 let random_election_timeout () =
     let s = election_timeout_spray in
     let r = Random.float (s*.2.) -. s +. 1. in
     assert (r > 0.) ;
     election_timeout *. r
 
+let rec until_diff x f =
+    let y = f () in
+    if x <> y then y else until_diff x f
 
 module type COMMAND = sig
     type t (* the type of a command for the state machine *)
@@ -271,7 +275,8 @@ struct
                     peers_info ;
                 let info = Hashtbl.find peers_info peer in
                 let entries = log_from t.logs info.next_index in
-                if force || entries <> [] || now -. info.last_sent > heartbeat_timeout then (
+                if force || now -. info.last_sent > heartbeat_timeout then (
+                    info.last_sent <- now ;
                     let arg =
                         let open RPC_Server_Types.AppendEntries in
                         let prev_log_term =
@@ -287,7 +292,6 @@ struct
                           leader_commit = t.commit_index } in
                     call_server t peer (RPC_Server_Types.AppendEntries arg) (function
                         | Ok res ->
-                            info.last_sent <- now ; (* avoid touching this in case of network failure *)
                             if res.success then (
                                 (* This peer received all our log *)
                                 info.next_index <- info.next_index + Array.length arg.entries ; (* incr from what he received *)
@@ -404,7 +408,7 @@ struct
                         let new_entry_idx = log_append t new_entry in
                         (* ...then issues AppendEntries in parallel to each of the other servers to
                          * replicate the entry. *)
-                        append_entries t peers_info ;
+                        append_entries ~force:nodelay_replication t peers_info ;
                         (* We have no idea when this will be committed, maybe only after several retries?
                          * So we enter a specific condition for every new entry, that's easy to check
                          * (if not fast) *)
@@ -475,17 +479,22 @@ struct
 
         let call t x k =
             let rec retry nb_try =
+                L.debug "Clt: Sending command to %s after %d tries" (Host.to_string t.leader) nb_try ;
                 if nb_try > max_nb_try then failwith "Too many retries" ;
+                let sent_to = t.leader in (* so that we can compare with redirection even after changing t.leader *)
                 RPC_ClientServers.call t.leader (ChangeState x) (function
                     | Ok (State (_log_index, state)) ->
                         k state
                     | Ok (Redirect leader') ->
-                        L.debug "Clt: Was told to redirect to %s" (Host.to_string leader') ;
+                        L.debug "Clt: Was told by %s to redirect to %s" (Host.to_string sent_to) (Host.to_string leader') ;
                         t.leader <-
-                            if leader' <> t.leader then leader' else (
-                                (* The server do not know who is the leader yet, try another one *)
-                                (* TODO: but the same one! *)
-                                random_leader t.servers
+                            if leader' <> sent_to then leader' else
+                            (* The server do not know who is the leader yet *)
+                            if t.leader <> sent_to then t.leader else (
+                                (* And I still don't know neither: try one at random *)
+                                let l = until_diff t.leader (fun () -> random_leader t.servers) in
+                                L.debug "Clt: Will redirect to %s instead" (Host.to_string l) ;
+                                l
                             ) ;
                         retry (nb_try+1)
                     | Ok (Info t) ->
