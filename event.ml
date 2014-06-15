@@ -84,7 +84,7 @@ let pause delay f =
     let date = Unix.gettimeofday () +. delay in
     alerts := AlertHeap.add (date, f) !alerts 
 
-let until cond f =
+let condition cond f =
     conditions := (cond, f)::!conditions
 
 let unregister handler =

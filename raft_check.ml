@@ -68,9 +68,12 @@ let main =
                 (match info.state with Leader _ -> incr nb_leaders | _ -> ())))
             servers ;
         (* wait until all responded *)
-        Event.until (fun () -> !nb_answers = Array.length servers)
+        Event.condition
+            (fun () -> !nb_answers = Array.length servers)
             (fun () ->
                 OUnit2.assert_equal !nb_leaders 1 ;
-                Event.clear ())) ;
+                Event.clear ()) ;
+        (* Apart from that, start perturbing the raft servers by sending some commands to the state machine *)
+        TestClient.call client 1 (fun r -> OUnit2.assert_equal r 1)) ;
     Event.loop ~timeout:(0.1 *. et) ()
 

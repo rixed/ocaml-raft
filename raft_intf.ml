@@ -28,7 +28,8 @@ struct
         val call : Host.t -> Types.arg -> (rpc_res -> unit) -> unit
         (* TODO: a call_multiple that allows several answers to be received. Useful to 
          * implement pubsub *)
-        val serve : Host.t -> (Types.arg -> Types.ret) -> unit
+
+        val serve : Host.t -> ((Types.ret -> unit) -> Types.arg -> unit) -> unit
     end
 
     module type Maker = functor(Types : TYPES) -> (S with module Types = Types)

@@ -37,9 +37,11 @@ struct
     let serve h f =
         let _shutdown = TcpServer.serve ?timeout ?max_accepted (string_of_int h.Host.port) (fun write input ->
             match input with
-            | Srv_IOType.Value (id, v) -> write (Srv_IOType.Write (id, f v))
+            | Srv_IOType.Value (id, v) ->
+                f (fun res -> write (Srv_IOType.Write (id, res))) v
             | Srv_IOType.Timeout
-            | Srv_IOType.EndOfFile -> write Srv_IOType.Close) in
+            | Srv_IOType.EndOfFile ->
+                write Srv_IOType.Close) in
         () (* we keep serving until we die *)
 
     module Clt_IOType = Event.MakeIOTypeRev(BaseIOType)

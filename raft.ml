@@ -50,8 +50,6 @@ struct
           mutable voted_for : Host.t option (* candidate that received vote in current term (if any) *) ;
           mutable logs : log_entry list (* FIXME: a resizeable array like BatDynArray for uncommitted and committed entries *) ;
           mutable commit_index : log_index (* index of highest log entry known to be committed *) ;
-          mutable last_applied : log_index (* index of highest log entry known to be applied to state machine *) ;
-          mutable last_state : Command.state option (* last apply result *) ;
           mutable last_leader : Host.t (* last leader we heard from *) ;
           mutable last_recvd_from_leader : float (* when we last heard from a leader *) ;
           mutable election_timeout : float }
@@ -120,8 +118,6 @@ struct
               voted_for = None ;
               logs = [] ;
               commit_index = 0 ;
-              last_applied = 0 ;
-              last_state = None ;
               last_leader = host ; (* no better idea *)
               last_recvd_from_leader = Unix.gettimeofday () }
 
@@ -134,9 +130,12 @@ struct
         (* raises Invalid_argument all kind of exception if idx is bogus *)
         let log_at logs idx =
             List.at logs (idx - 1 (* first index is 1 *))
+        (* Return the list of logs starting at a given index *)
+        let log_from logs idx =
+            List.drop (idx-1) logs
         (* Append a new log entry and return last one's index *)
-        let log_append t entries =
-            t.logs <- t.logs @ entries ;
+        let log_append t entry =
+            t.logs <- t.logs @ [entry] ;
             List.length t.logs (* first index is 1 *)
         let log_last_index logs =
             List.length logs
@@ -251,50 +250,64 @@ struct
                         min arg.leader_commit (List.length new_logs)
                     else t.commit_index in
                 t.logs <- new_logs ;
-                (* Apply all the new commands *)
-                t.commit_index <- new_commit_index ;
-                while t.last_applied < t.commit_index do
-                    t.last_applied <- t.last_applied + 1 ;
-                    t.last_state <- Some (apply (log_at t.logs t.last_applied).command)
+                (* We always apply what's committed *)
+                for i = t.commit_index+1 to new_commit_index do
+                    apply (log_at t.logs i).command
                 done ;
+                t.commit_index <- new_commit_index ;
                 answer ~dest:arg.leader_id t true
             )
 
         (* Send the entries to every other peers *)
-        let append_entries t peers_info entries peers k =
-            if entries = [] && peers = [] then () else
-            let new_idx = log_append t entries in
-            let arg =
-                let open RPC_Server_Types.AppendEntries in
-                let prev_log_term =
-                    if new_idx > 1 then (
-                        let prev_log = log_at t.logs (new_idx-1) in
-                        prev_log.term
-                    ) else 0 in
-                { term = t.current_term ;
-                  leader_id = t.host ;
-                  prev_log_index = new_idx-1 ;
-                  prev_log_term ;
-                  entries = Array.of_list entries ;
-                  leader_commit = t.commit_index } in
+        let append_entries ?(force=false) t peers_info =
             let now = Unix.gettimeofday () in
             List.iter (fun peer ->
                 Hashtbl.modify_opt peer (function
                     | None -> (* create this info *)
-                        Some { next_index = new_idx+1 ;
+                        Some { next_index = log_last_index t.logs + 1 ;
                                match_index = 0 ;
                                last_sent = now }
-                    | Some info as x ->
-                        info.last_sent <- now ;
-                        x) peers_info ;
-                call_server t peer (RPC_Server_Types.AppendEntries arg) k) peers
+                    | x -> x)
+                    peers_info ;
+                let info = Hashtbl.find peers_info peer in
+                let entries = log_from t.logs info.next_index in
+                if force || entries <> [] || now -. info.last_sent > heartbeat_timeout then (
+                    let arg =
+                        let open RPC_Server_Types.AppendEntries in
+                        let prev_log_term =
+                            if info.next_index > 1 then (
+                                let prev_log = log_at t.logs (info.next_index-1) in
+                                prev_log.term
+                            ) else 0 in
+                        { term = t.current_term ;
+                          leader_id = t.host ;
+                          prev_log_index = info.next_index-1 ;
+                          prev_log_term ;
+                          entries = Array.of_list entries ;
+                          leader_commit = t.commit_index } in
+                    call_server t peer (RPC_Server_Types.AppendEntries arg) (function
+                        | Ok res ->
+                            info.last_sent <- now ; (* avoid touching this in case of network failure *)
+                            if res.success then (
+                                (* This peer received all our log *)
+                                info.next_index <- info.next_index + Array.length arg.entries ; (* incr from what he received *)
+                                info.match_index <- info.next_index - 1
+                            ) else (
+                                (* The peer could find where to attach that *)
+                                info.next_index <- info.next_index - 1
+                                (* TODO: retry faster *)
+                            )
+                        | Err err ->
+                            L.error "%a: Cannot append entries to %s: %s" print t (Host.to_string peer) err)
+                )
+            ) t.peers
 
         let convert_to_leader t =
             L.debug "%a: Converting to Leader" print t ;
             assert (t.state = Candidate) ;
             let peers_info = Hashtbl.create (List.length t.peers) in
             t.state <- Leader peers_info ;
-            append_entries t peers_info [] t.peers ignore (* will fill peers_info *)
+            append_entries ~force:true t peers_info (* will fill peers_info *)
 
         let convert_to_candidate t =
             L.debug "%a: Converting to Candidate" print t ;
@@ -327,7 +340,7 @@ struct
                         ) else L.debug "%a: still only %d wins" print t !nb_wins ;
                         if t.state = Candidate && (* I'm still candidate *)
                            t.current_term = term && (* for *this* election *)
-                           !nb_wins > nb_peers t / 2
+                           !nb_wins > (nb_peers t + 1) / 2
                         then convert_to_leader t
                     | Err _err -> ()))
 
@@ -339,13 +352,17 @@ struct
                 convert_to_follower t
             )
 
+        let is_committed t peers_info log_idx =
+            let nb_res = ref 1 in (* at least me *)
+            try Hashtbl.iter (fun _ info ->
+                    if info.match_index >= log_idx then (
+                        incr nb_res ;
+                        if !nb_res > (nb_peers t + 1) / 2 then raise Exit
+                    )) peers_info ;
+                false
+            with Exit -> true
 
-        let may_send_heartbeat t peers_info now =
-            (* Send a heartbeat to every other hosts which I haven't sent anything for too long *)
-            let old_peers = Hashtbl.fold (fun peer info lst ->
-                if now -. info.last_sent > heartbeat_timeout then peer::lst else lst)
-                peers_info [] in
-            append_entries t peers_info [] old_peers ignore (* just to say hello *)
+        let is_leader t = match t.state with Leader _ -> true | _ -> false
 
         let serve pub_host peers apply =
             (* the raft host listen on next port compared to public host *)
@@ -369,45 +386,57 @@ struct
                         convert_to_candidate t
                     )
                 | Leader peers_info ->
-                    may_send_heartbeat t peers_info now
+                    (* heartbeat *)
+                    append_entries t peers_info
             ) ;
-            RPC_ClientServers.serve pub_host (function
+            RPC_ClientServers.serve pub_host (fun write cmd ->
+                match cmd with
                 | ChangeState command ->
                     (match t.state with
                     | Leader peers_info ->
                         (* Leaders: if command received from client: append entry to local log, *)
                         let new_entry = { command ; term = t.current_term } in
+                        let new_entry_idx = log_append t new_entry in
                         (* ...then issues AppendEntries in parallel to each of the other servers to
                          * replicate the entry. *)
-                        (* TODO: send only this entry? *)
-                        let nb_res = ref 0 in
-                        append_entries t peers_info [new_entry] t.peers (fun _res ->
-                            incr nb_res ;
-                            L.debug "%a: Received %d answers from followers" print t !nb_res) ;
-                        (* TODO: This is my understanding that we cannot serve anything else until this query is answered *)
-                        while !nb_res < nb_peers t do
-                            Unix.sleep 1 (* FIXME: condvar *)
-                        done ;
-                        (* When the entry has been safely replicated the leader
-                         * applies the entry to its state machine and returns the result of that
-                         * execution to the client. *)
-                        let res = apply command in
-                        State (List.length t.logs, res)
+                        append_entries t peers_info ;
+                        (* We have no idea when this will be committed, maybe only after several retries?
+                         * So we enter a specific condition for every new entry, that's easy to check
+                         * (if not fast) *)
+                        Event.condition
+                            (fun () ->
+                                t.commit_index = new_entry_idx - 1 && (* since commit_index increase 1 by 1 on server, by construction below *)
+                                is_committed t peers_info new_entry_idx)
+                            (fun () ->
+                                L.debug "%a: Entry %d is committed" print t new_entry_idx ;
+                                (* When the entry has been committed the leader
+                                 * applies the entry to its state machine and returns the result of that
+                                 * execution to the client. *)
+                                (* only do this if I'm still Leader *)
+                                if is_leader t then (
+                                    t.commit_index <- new_entry_idx ;
+                                    let res = apply command in
+                                    write (State (new_entry_idx, res))
+                                ) else (
+                                    L.debug "%a: Too bad I'm not leader anymore :(" print t ;
+                                    write (Redirect t.last_leader)
+                                ))
                     | _ ->
                         L.debug "%a: Received a command while I'm not the leader, redirecting to %s" print t (Host.to_string t.last_leader) ;
-                        Redirect t.last_leader)
-                | QueryInfo -> Info t) ;
-            RPC_Servers.serve raft_host (function
+                        write (Redirect t.last_leader))
+                | QueryInfo -> write (Info t)) ;
+            RPC_Servers.serve raft_host (fun write cmd ->
+                match cmd with
                 | RequestVote arg ->
                     let open RPC_Server_Types.RequestVote in
                     may_become_follower t arg.term ;
-                    answer_request_vote t arg
+                    write (answer_request_vote t arg)
                 | AppendEntries arg ->
                     let open RPC_Server_Types.AppendEntries in
                     may_become_follower t arg.term ;
                     if t.state = Candidate && arg.term = t.current_term then
                         convert_to_follower t ;
-                    answer_append_entries t apply arg)
+                    write (answer_append_entries t apply arg))
     end
 
     (* We also have RPCs from clients to raft servers to append Commands.
