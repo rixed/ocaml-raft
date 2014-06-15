@@ -57,6 +57,7 @@ let main =
     let client = TestClient.make servers in
     (* Give the server a head start and make sure they elected a leader after 2*election_timeout *)
     let et = Raft.election_timeout in
+    let nb_tests = ref 0 in
     Event.pause (2. *. et) (fun () ->
         (* Check there is only one leader *)
         (* We do this by sending a special 'dump' RPC to each servers (it works because we run this
@@ -70,10 +71,12 @@ let main =
         (* wait until all responded *)
         Event.condition
             (fun () -> !nb_answers = Array.length servers)
-            (fun () ->
-                OUnit2.assert_equal !nb_leaders 1 ;
-                Event.clear ()) ;
-        (* Apart from that, start perturbing the raft servers by sending some commands to the state machine *)
-        TestClient.call client 1 (fun r -> OUnit2.assert_equal r 1)) ;
+            (fun () -> OUnit2.assert_equal !nb_leaders 1 ; incr nb_tests) ;
+        Event.pause (3. *. et) (fun () ->
+            (* Apart from that, start perturbing the raft servers by sending some commands to the state machine *)
+            TestClient.call client 1 (fun r -> OUnit2.assert_equal r 1 ; incr nb_tests))) ;
+    Event.condition
+        (fun () -> !nb_tests >= 2)
+        (fun () -> Event.clear ()) ;
     Event.loop ~timeout:(0.1 *. et) ()
 

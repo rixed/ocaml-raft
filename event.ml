@@ -131,7 +131,7 @@ module BufferedIO (T : IOType) =
 struct
     let try_write_buf buf fd =
         let str = Buffer.contents buf in
-        L.debug "writing %d bytes info fd %a ('%s')" (String.length str) Log.file fd str ;
+        L.debug "writing %d bytes info fd %a" (String.length str) Log.file fd ;
         let sz = Unix.single_write fd str 0 (String.length str) in
         Buffer.clear buf ;
         Buffer.add_substring buf str sz (String.length str - sz)
@@ -161,7 +161,7 @@ struct
                 if len < value_len then ofs else (
                     (* Otherwise use this header to find out data size
                      * Note: data size does not include header size *)
-                    let v : T.t_read = Marshal.from_string content ofs in
+                    let v = Marshal.from_string content ofs in
                     value_cb writer (T.Value v) ;
                     read_next content (ofs + value_len)
                 ) in

@@ -364,11 +364,16 @@ struct
 
         let is_leader t = match t.state with Leader _ -> true | _ -> false
 
+        let pub_of_raft (h : Host.t) = { h with port = h.port - 1 }
+        let raft_of_pub (h : Host.t) = { h with port = h.port + 1 }
+
+        let redirect t write =
+            write (RPC_ClientServer_Types.Redirect (pub_of_raft t.last_leader))
+
         let serve pub_host peers apply =
             (* the raft host listen on next port compared to public host *)
-            let to_raft (h : Host.t) = { h with port = h.port + 1 } in
-            let raft_host = to_raft pub_host in
-            let raft_peers = List.map to_raft peers in
+            let raft_host = raft_of_pub pub_host in
+            let raft_peers = List.map raft_of_pub peers in
             let t = init_follower raft_host raft_peers in
             (* Add a timeout function *)
             Event.register_timeout (fun _handler ->
@@ -419,11 +424,11 @@ struct
                                     write (State (new_entry_idx, res))
                                 ) else (
                                     L.debug "%a: Too bad I'm not leader anymore :(" print t ;
-                                    write (Redirect t.last_leader)
+                                    redirect t write
                                 ))
                     | _ ->
                         L.debug "%a: Received a command while I'm not the leader, redirecting to %s" print t (Host.to_string t.last_leader) ;
-                        write (Redirect t.last_leader))
+                        redirect t write)
                 | QueryInfo -> write (Info t)) ;
             RPC_Servers.serve raft_host (fun write cmd ->
                 match cmd with
