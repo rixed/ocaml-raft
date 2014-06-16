@@ -438,14 +438,20 @@ struct
                 match cmd with
                 | RequestVote arg ->
                     let open RPC_Server_Types.RequestVote in
-                    may_become_follower t arg.term ;
-                    write (answer_request_vote t arg)
+                    (* Ignore commands with old term *)
+                    if arg.term >= t.current_term then (
+                        may_become_follower t arg.term ;
+                        write (answer_request_vote t arg)
+                    )
                 | AppendEntries arg ->
                     let open RPC_Server_Types.AppendEntries in
-                    may_become_follower t arg.term ;
-                    if t.state = Candidate && arg.term = t.current_term then
-                        convert_to_follower t ;
-                    write (answer_append_entries t apply arg))
+                    (* Ignore commands with old term *)
+                    if arg.term >= t.current_term then (
+                        may_become_follower t arg.term ;
+                        if t.state = Candidate && arg.term = t.current_term then
+                            convert_to_follower t ;
+                        write (answer_append_entries t apply arg)
+                    ))
     end
 
     (* We also have RPCs from clients to raft servers to append Commands.
