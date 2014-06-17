@@ -1,24 +1,16 @@
-(* To stress test RAFT for real, we start M clients and pick at random a list
- * of pair (client_idx, request). Then we create a set a N servers
- * and start playing the sequence of queries while perturbing the servers.
- * At the end we save the last result.
- * We restart with N' servers, perturbing them in a different way, and check
- * we obtain the same result.
- * Etc...
+(* How to stress test:
+ * 1- log every apply operation (log index and actual command) in each
+ *    server and at the end check that they are all the same.
+ *    Also, check all the (index, op) in the client when they are acked,
+ *    and check that they are all in the submitted log and there are
+ *    nothing in the submitted log that was not acked.
+ *    See check_output.ml for the checking program.
  *
- * The first run should start with a single, reliable server, so that we know
- * the expected result!
- *
- * If the result differ then we want to be able to see a detailed log of
- * what happened, so log everything exhaustively!
- *
- * Note that the RPC mechanism we need here can be as simple as local function
- * call, since the random query list is the sequence in which the leader receive
- * the message (so any effect due to reordering or redirections from followers
- * to leader are already included).
- *
- * The service is simple yet depend on the order of execution: add to the current
- * value with the value provided by client, then multiply by it, and take the modulo.
+ * 2- all communications must go through a proxy that will add delay/drops
+ *    (fuzzing will be addressed separately by checksuming the PDUs).
+ *    It should not be aware of the actual protocol but we are going to kill
+ *    Marsal if we drop anything right now. So we must just delay for now,
+ *    and protect against drop/fuzzing next.
  *)
 open Batteries
 open Raft_intf
@@ -26,6 +18,7 @@ open Raft_intf
 module Command =
 struct
     type t = int
+    let print = Int.print
     type state = int
 end
 
@@ -85,6 +78,8 @@ let main =
             do_test 3 27)) ;
     Event.condition
         (fun () -> !nb_tests = 4)
-        (fun () -> Event.clear ()) ;
+        (fun () ->
+            (* Wait a little bit more for raft servers to apply everything *)
+            Event.pause (3. *. et) (fun () -> Event.clear ())) ;
     Event.loop ~timeout:(0.1 *. et) ()
 

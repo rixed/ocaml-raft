@@ -22,6 +22,7 @@ let rec until_diff x f =
 
 module type COMMAND = sig
     type t (* the type of a command for the state machine *)
+    val print : 'a BatInnerIO.output -> t -> unit
     type state (* the type of the value of the state machine, aka apply return value *)
 end
 
@@ -134,6 +135,9 @@ struct
         (* raises Invalid_argument all kind of exception if idx is bogus *)
         let log_at logs idx =
             List.at logs (idx - 1 (* first index is 1 *))
+        let log_at_option logs idx =
+            try Some (List.at logs idx)
+            with Invalid_argument _ -> None
         (* Return the list of logs starting at a given index *)
         let log_from logs idx =
             List.drop (idx-1) logs
@@ -207,6 +211,11 @@ struct
             if grant then t.voted_for <- Some arg.candidate_id ;
             answer ~dest:arg.candidate_id ~reason t grant
 
+        let log_and_apply t i apply =
+            let l = log_at t.logs i in
+            L.debug "%a: Applying (%d,%a,%d)" print t i Command.print l.command l.term ;
+            apply l.command
+
         (* Used by followers *)
         let answer_append_entries t apply arg =
             assert (t.state = Follower) ;
@@ -215,8 +224,11 @@ struct
             (* Reply false if term < currentTerm *)
             if arg.term < t.current_term then answer ~dest:arg.leader_id ~reason:"Too old to be a leader" t false else
             (* Reply false if log doesn't contain an entry at prev_log_index whose term matches prev_log_term *)
-            if arg.prev_log_index > 0 && (let log = log_at t.logs arg.prev_log_index in log.term) <> arg.prev_log_term then (
-                answer ~dest:arg.leader_id ~reason:"logs looks dubious" t false
+            if arg.prev_log_index > 0 &&
+               (match log_at_option t.logs arg.prev_log_index with
+                | Some log -> log.term <> arg.prev_log_term
+                | _ -> true) then (
+                answer ~dest:arg.leader_id ~reason:"I'm missing the previous log" t false
             ) else
             (* If an existing entry conflicts with a new one (same index but different terms),                 
              * delete the existing entry and all that follow it *)
@@ -256,7 +268,7 @@ struct
                 t.logs <- new_logs ;
                 (* We always apply what's committed *)
                 for i = t.commit_index+1 to new_commit_index do
-                    apply (log_at t.logs i).command
+                    log_and_apply t i apply
                 done ;
                 t.commit_index <- new_commit_index ;
                 answer ~dest:arg.leader_id t true
@@ -424,7 +436,7 @@ struct
                                 (* only do this if I'm still Leader *)
                                 if is_leader t then (
                                     t.commit_index <- new_entry_idx ;
-                                    let res = apply command in
+                                    let res = log_and_apply t new_entry_idx apply in
                                     write (State (new_entry_idx, res))
                                 ) else (
                                     L.debug "%a: Too bad I'm not leader anymore :(" print t ;
@@ -489,7 +501,8 @@ struct
                 if nb_try > max_nb_try then failwith "Too many retries" ;
                 let sent_to = t.leader in (* so that we can compare with redirection even after changing t.leader *)
                 RPC_ClientServers.call t.leader (ChangeState x) (function
-                    | Ok (State (_log_index, state)) ->
+                    | Ok (State (log_index, state)) ->
+                        L.debug "Clt: Ack for (%d,%a)" log_index Command.print x ;
                         k state
                     | Ok (Redirect leader') ->
                         L.debug "Clt: Was told by %s to redirect to %s" (Host.to_string sent_to) (Host.to_string leader') ;

@@ -41,6 +41,9 @@ check-spec: $(TEST_PROGRAMS:.ml=.byte)
 	  ./$$p && echo "$$p OK" || (echo ; echo "     XXXXX $$p FAILED!! XXXXX" ; echo) ;\
 	done
 
+stress: raft_check.opt check_output.opt
+	./raft_check.opt 2>&1 | ./check_output.opt
+
 clean-spec:
 
 dep-spec:
