@@ -36,7 +36,7 @@ run: raft.top
 TEST_PROGRAMS = raft_check.ml
 check.cmo: $(ARCHIVE)
 raft_check.cmo: $(ARCHIVE)
-check-spec: $(TEST_PROGRAMS:.ml=.byte)
+check-spec: $(TEST_PROGRAMS:.ml=.opt)
 	@for p in $^ ; do \
 	  ./$$p && echo "$$p OK" || (echo ; echo "     XXXXX $$p FAILED!! XXXXX" ; echo) ;\
 	done

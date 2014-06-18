@@ -1,6 +1,8 @@
 open Batteries
 open Raft_intf
 
+module L = Log.Info
+
 (* RPC through TCP *)
 
 module type TCP_CONFIG =
@@ -72,24 +74,36 @@ struct
             | Some w -> w
             | None ->
                 (* connect to the server *)
+                L.debug "Need a new connection to %s" (Host.to_string h) ;
                 let w = TcpClient.client ?timeout h.Host.name (string_of_int h.Host.port) (fun write input ->
                     match input with
                     | Clt_IOType.Value (id, v) ->
-                        Hashtbl.modify_opt id (function
-                            | None -> failwith "TODO"
-                            | Some k -> k (Ok v) ; None)
-                            continuations ;
+                        (* Note: we can't modify continuations in place because we'd
+                         * have to call write before returning to modify_opt, and write
+                         * can itself update the hash. *)
+                        (match Hashtbl.find_option continuations id with
+                        | None ->
+                            L.error "No continuation for message id %d" id ;
+                            failwith "Invalid incoming message id"
+                        | Some k ->
+                            L.debug "Continuing message id %d" id ;
+                            k (Ok v) ;
+                            Hashtbl.remove continuations id)
                     | Clt_IOType.Timeout
                     | Clt_IOType.EndOfFile ->
                         (* notify all continuations *)
-                        Hashtbl.iter (fun _id k ->
-                            k (Err "Connection closed")) continuations ;
+                        Hashtbl.filteri_inplace (fun id k ->
+                            L.debug "Expiring termination for message id %d" id ;
+                            k (Err "Connection closed") ;
+                            false) continuations ;
                         write Close ;
                         Hashtbl.remove cnxs h) in
                 Hashtbl.add cnxs h w ;
                 w in
         let id = next_id () in
         Hashtbl.add continuations id k ;
+        L.debug "Saving continuation for message id %d (147 %s there)" id
+            (if Hashtbl.mem continuations 147 then "still" else "NOT") ;
         writer (Write (id, v))
 
 end

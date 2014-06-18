@@ -41,13 +41,14 @@ end
 module TestClient = Raft_impl.Client
 
 let main =
-    let servers = Array.init 5 (fun _ -> Host.make "localhost" (Random.int 64510 + 1024)) in
+    let nb_servers = 9 and nb_clients = 20 and nb_msgs = 100 in
+    let servers = Array.init nb_servers (fun _ -> Host.make "localhost" (Random.int 64510 + 1024)) in
     Array.iter (fun s ->
         (* peers = list of all servers but s *)
         let peers = Array.fold_left (fun lst h -> if h = s then lst else h::lst) [] servers in
         TestServer.serve s peers)
         servers ;
-    let client = TestClient.make servers in
+    let clients = Array.init nb_clients (fun i -> TestClient.make ("Clt"^ string_of_int i)  servers) in
     (* Give the server a head start and make sure they elected a leader after 2*election_timeout *)
     let et = Raft.election_timeout in
     let nb_tests = ref 0 in
@@ -57,7 +58,7 @@ let main =
          * in 'stopped clock' mode) *)
         let nb_leaders = ref 0 and nb_answers = ref 0 in
         Array.iter (fun s ->
-            TestClient.info client s (fun info ->
+            TestClient.info clients.(0) s (fun info ->
                 incr nb_answers ;
                 (match info.state with Leader _ -> incr nb_leaders | _ -> ())))
             servers ;
@@ -65,19 +66,16 @@ let main =
         Event.condition
             (fun () -> !nb_answers = Array.length servers)
             (fun () -> OUnit2.assert_equal !nb_leaders 1 ; incr nb_tests) ;
-        Event.pause (3. *. et) (fun () ->
-            let do_test i _o =
-                Log.info "Sending %d..." i ;
-                TestClient.call client i (fun r ->
-                    Log.info "Sent %d, got %d" i r ;
-                    (*OUnit2.assert_equal r o ;*)
-                    incr nb_tests) in
-            (* Apart from that, start perturbing the raft servers by sending some commands to the state machine *)
-            do_test 1 1 ;
-            do_test 2 6 ;
-            do_test 3 27)) ;
+        (* Now start sending random commands. Each client must wait for confirmation of previous
+         * command because otherwise we would not be certain of what order the commands were acked.
+         * This does not change anything for the servers. *)
+        let rec client_behavior nb_msg client =
+            if nb_msg = 0 then incr nb_tests else
+            TestClient.call client (Random.int 999) (fun _res ->
+                client_behavior (nb_msg-1) client) in
+        Array.iter (client_behavior nb_msgs) clients) ;
     Event.condition
-        (fun () -> !nb_tests = 4)
+        (fun () -> !nb_tests = 1 + Array.length clients)
         (fun () ->
             (* Wait a little bit more for raft servers to apply everything *)
             Event.pause (3. *. et) (fun () -> Event.clear ())) ;

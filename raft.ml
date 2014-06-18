@@ -236,7 +236,7 @@ struct
                 match to_append with
                 | [] -> (* we are done *)
                     true, List.rev new_logs_rev
-                | _new_e::to_append' ->
+                | new_e::to_append' ->
                     (match logs with
                     | [] -> (* no more logs, append what we have *)
                         if idx > arg.prev_log_index then
@@ -253,8 +253,8 @@ struct
                         ) else ( (* idx > arg.prev_log_index *)
                             if e.term <> arg.prev_log_term then
                                 aux new_logs_rev idx to_append []
-                            else (* we assume the e = new_e *)
-                                aux (e::new_logs_rev) (idx+1) to_append' logs
+                            else
+                                aux (new_e::new_logs_rev) (idx+1) to_append' logs
                         )
                     ) in
             let success, new_logs = aux [] 1 (Array.to_list arg.entries) t.logs in
@@ -477,50 +477,54 @@ struct
      * have previously been returned *)
     module Client =
     struct
-        type t = { servers : Host.t array ; (* List of all known servers *)
+        type t = { name : string ;
+                   servers : Host.t array ; (* List of all known servers *)
                    mutable leader : Host.t (* the one believed to be good *) }
+
+        let print fmt t =
+            Printf.fprintf fmt "%20s@%s" (Log.colored true 2 "   Client") t.name
 
         let random_leader servers = servers.(Random.int (Array.length servers))
 
-        let make servers =
-            { servers ; leader = random_leader servers }
+        let make name servers =
+            { name ; servers ; leader = random_leader servers }
 
         let max_nb_try = 5
 
-        let info _t host k =
+        let info t host k =
             RPC_ClientServers.call host QueryInfo (function
                 | Ok (Info info) -> k info
                 | Ok _ ->
-                    L.debug "Clt: server %s answering with state not infos" (Host.to_string host)
+                    L.debug "%a: server %s answering with state not infos" print t (Host.to_string host)
                 | Err x ->
-                    L.debug "Clt: Can't get infos from %s: %s" (Host.to_string host) x)
+                    L.debug "%a: Can't get infos from %s: %s" print t (Host.to_string host) x)
 
         let call t x k =
             let rec retry nb_try =
-                L.debug "Clt: Sending command to %s after %d tries" (Host.to_string t.leader) nb_try ;
+                L.debug "%a: Sending command to %s after %d tries" print t (Host.to_string t.leader) nb_try ;
                 if nb_try > max_nb_try then failwith "Too many retries" ;
                 let sent_to = t.leader in (* so that we can compare with redirection even after changing t.leader *)
                 RPC_ClientServers.call t.leader (ChangeState x) (function
                     | Ok (State (log_index, state)) ->
-                        L.debug "Clt: Ack for (%d,%a)" log_index Command.print x ;
+                        L.debug "%a: Ack for (%d,%a)" print t log_index Command.print x ;
                         k state
                     | Ok (Redirect leader') ->
-                        L.debug "Clt: Was told by %s to redirect to %s" (Host.to_string sent_to) (Host.to_string leader') ;
+                        L.debug "%a: Was told by %s to redirect to %s" print t (Host.to_string sent_to) (Host.to_string leader') ;
                         t.leader <-
                             if leader' <> sent_to then leader' else
                             (* The server do not know who is the leader yet *)
                             if t.leader <> sent_to then t.leader else (
                                 (* And I still don't know neither: try one at random *)
                                 let l = until_diff t.leader (fun () -> random_leader t.servers) in
-                                L.debug "Clt: Will redirect to %s instead" (Host.to_string l) ;
+                                L.debug "%a: Will redirect to %s instead" print t (Host.to_string l) ;
                                 l
                             ) ;
                         retry (nb_try+1)
-                    | Ok (Info t) ->
-                        L.debug "Clt: server %s sending its status out of the blue?" (Host.to_string t.host) ;
+                    | Ok (Info s) ->
+                        L.debug "%a: server %s sending its status out of the blue?" print t (Host.to_string s.host) ;
                         assert false (* TODO *)
                     | Err x ->
-                        L.debug "Clt: Can't get state from %s: %s" (Host.to_string t.leader) x ;
+                        L.debug "%a: Can't get state from %s: %s" print t (Host.to_string t.leader) x ;
                         (* try another server? *)
                         t.leader <- random_leader t.servers ;
                         retry (nb_try+1))
