@@ -41,7 +41,7 @@ end
 module TestClient = Raft_impl.Client
 
 let main =
-    let nb_servers = 5 and nb_clients = 5 and nb_msgs = 100 in
+    let nb_servers = 7 and nb_clients = 10 and nb_msgs = 1000 in
     let servers = Array.init nb_servers (fun _ -> Host.make "localhost" (Random.int 64510 + 1024)) in
     Array.iter (fun s ->
         (* peers = list of all servers but s *)
@@ -52,6 +52,7 @@ let main =
     (* Give the server a head start and make sure they elected a leader after 2*election_timeout *)
     let et = Raft.election_timeout in
     let nb_tests = ref 0 in
+    let tot_ack_time = ref 0. and tot_acks = ref 0 in
     Event.pause (2. *. et) (fun () ->
         (* Check there is only one leader *)
         (* We do this by sending a special 'dump' RPC to each servers (it works because we run this
@@ -71,7 +72,11 @@ let main =
          * This does not change anything for the servers. *)
         let rec client_behavior nb_msg client =
             if nb_msg = 0 then incr nb_tests else
+            let now = Unix.gettimeofday () in
             TestClient.call client (Random.int 999) (fun _res ->
+                let dt = Unix.gettimeofday () -. now in
+                tot_ack_time := !tot_ack_time +. dt ;
+                incr tot_acks ;
                 client_behavior (nb_msg-1) client) in
         Array.iter (client_behavior nb_msgs) clients) ;
     Event.condition
@@ -79,5 +84,6 @@ let main =
         (fun () ->
             (* Wait a little bit more for raft servers to apply everything *)
             Event.pause 1. (fun () -> Event.clear ())) ;
-    Event.loop ~timeout:(0.1 *. et) ()
+    Event.loop ~timeout:(0.1 *. et) () ;
+    Printf.printf "%d messages acked, avg resp time %gs\n" !tot_acks (!tot_ack_time /. float_of_int !tot_acks)
 

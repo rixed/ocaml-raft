@@ -30,12 +30,6 @@ end
 module Make (RPC_Maker : RPC.Maker) (Command : COMMAND) =
 struct
 
-    type log_entry =
-        { command : Command.t (* command for the state machine *) ;
-          term : term_id (* when it was received *) }
-    let log_entry_print fmt entry =
-        Printf.fprintf fmt "{command=%a, term=%d}" Command.print entry.command entry.term
-
     type peer_info = { mutable next_index : int (* index of the next log entry to send there *) ;
                        mutable match_index : int (* index of highest log entry known to be replicated there *) ;
                        mutable last_sent : float (* when we last sent entries there *) ;
@@ -56,14 +50,10 @@ struct
           mutable current_term : term_id (* latest term server has seen (initialized to 0 at startup, increases monotonically) *) ;
           mutable voted_for : Host.t option (* candidate that received vote in current term (if any) *) ;
           mutable commit_index : int (* index of highest log entry known to be committed *) ;
+          mutable last_applied : int (* last index we applied *) ;
           mutable last_leader : Host.t (* last leader we heard from *) ;
           mutable last_recvd_from_leader : float (* when we last heard from a leader *) ;
           mutable election_timeout : float }
-    (* We store logs outside because we don't want to return those when asked for internal infos
-     * (to be honest, that's because we can't marshal them) *)
-    type server =
-        { info : server_info ;
-          mutable logs : log_entry DynArray.t }
 
     (* Same RPC_ClientServers for both Server and Client *)
     module RPC_ClientServer_Types =
@@ -75,6 +65,24 @@ struct
                  | Info of server_info (* to a QueryInfo only *)
     end
     module RPC_ClientServers = RPC_Maker (RPC_ClientServer_Types)
+
+    type log_entry =
+        { command : Command.t (* command for the state machine *) ;
+          term : term_id (* when it was received *) ;
+          write : RPC_ClientServer_Types.ret -> unit (* the function to answer to client when it's applied *) }
+    let log_entry_print fmt entry =
+        Printf.fprintf fmt "{command=%a, term=%d}" Command.print entry.command entry.term
+
+    (* Same without the write function that we don't send to replicas *)
+    type append_entry =
+        { append_command : Command.t ;
+          append_term : term_id }
+
+    (* We store logs outside because we don't want to return those when asked for internal infos
+     * (to be honest, that's because we can't marshal them) *)
+    type server =
+        { info : server_info ;
+          mutable logs : log_entry DynArray.t }
 
     module Server =
     struct
@@ -100,7 +108,7 @@ struct
                       leader_id : Host.t (* so follower can redirect clients *) ;
                       prev_log_index : int (* index of log entry immediately preceding new ones (FIXME: what if the log was empty?) *) ;
                       prev_log_term : term_id (* term of prev_log_index entry (FIXME: idem) *) ;
-                      entries : log_entry array (* log entries to store *) ;
+                      entries : append_entry array (* log entries to store *) ;
                       leader_commit : int (* leader's commit_index *) }
             end
             type arg = RequestVote of RequestVote.arg
@@ -128,6 +136,7 @@ struct
                        host ; peers ;
                        voted_for = None ;
                        commit_index = 0 ;
+                       last_applied = 0 ;
                        last_leader = host ; (* no better idea *)
                        last_recvd_from_leader = Unix.gettimeofday () } ;
               logs = DynArray.create () }
@@ -145,15 +154,17 @@ struct
             try Some (log_at logs idx)
             with DynArray.Invalid_arg _ -> None
         (* Return the list of logs starting at a given index *)
-        let log_from logs idx =
+        let append_log_from logs idx =
             let fst = idx-1 in
             let len = DynArray.length logs - fst in
-            DynArray.sub logs fst len |>
-            DynArray.to_array
+            Array.init len (fun i ->
+                let entry = DynArray.get logs (fst+i) in
+                { append_command = entry.command ;
+                  append_term = entry.term })
         (* Append a new log entry and return last one's index *)
-        let log_append logs entry =
-            DynArray.add logs entry ;
-            DynArray.length logs (* first index is 1 *)
+        let log_append logs command term write =
+            let entry = { command ; term ; write } in
+            DynArray.add logs entry
         let log_last_index logs =
             DynArray.length logs
         let log_truncate t n =
@@ -228,13 +239,48 @@ struct
             if grant then t.info.voted_for <- Some arg.candidate_id ;
             answer ~dest:arg.candidate_id ~reason t grant
 
-        let verbose_apply t i apply =
-            let l = log_at t.logs i in
-            L.debug "%a: Applying (%d,%a,%d)" print t i Command.print l.command l.term ;
-            apply l.command
+        (* tells whether a majority of servers have log_idx in their log *)
+        let is_committed t peers_info log_idx =
+            let nb_res = ref 1 in (* at least me *)
+            let has_quota () = !nb_res > (nb_peers t + 1) / 2 in
+            try Hashtbl.iter (fun _ info ->
+                    if info.match_index >= log_idx then (
+                        incr nb_res ;
+                        if has_quota () then (
+                            L.debug "quota for submission (%d)!" !nb_res ;
+                            raise Exit
+                        ) else
+                            L.debug "no quota for submission yet (%d)" !nb_res
+                    )) peers_info ;
+                if has_quota () then (
+                    L.debug "quota for submission (%d)!" !nb_res ; true
+                ) else (
+                    L.debug "no quota for submission yet (%d)" !nb_res ; false
+                )
+            with Exit -> true
+
+        (* where leaders try to increase their commit_index *)
+        let try_commit t peers_info =
+            for n = t.info.commit_index+1 to log_last_index t.logs do
+                let entry = log_at t.logs n in
+                if entry.term = t.info.current_term &&
+                   is_committed t peers_info n then (
+                    L.debug "%a: Entry %d is committed" print t n ;
+                    t.info.commit_index <- n
+                )
+            done
+
+        let try_apply t apply =
+            while t.info.last_applied < t.info.commit_index do
+                t.info.last_applied <- t.info.last_applied+1 ;
+                let entry = log_at t.logs t.info.last_applied in
+                L.debug "%a: Applying (%d,%a,%d)" print t t.info.last_applied Command.print entry.command entry.term ;
+                let res = apply entry.command in
+                entry.write (State (t.info.last_applied, res))
+            done
 
         (* Used by followers *)
-        let answer_append_entries t apply arg =
+        let answer_append_entries t arg =
             assert (t.info.state = Follower) ;
             reset_election_timeout t ;
             let open RPC_Server_Types.AppendEntries in
@@ -250,23 +296,32 @@ struct
                arg.prev_log_term <> (Option.get (log_at_opt t.logs arg.prev_log_index)).term then
                 let reason = Printf.sprintf "my previous entry at pos %d was not term %d"
                                 arg.prev_log_index arg.prev_log_term in
-                answer ~dest:arg.leader_id ~reason t false else
-            (* all is good, truncate my logs after prev_log_term and append new entries *)
-            let prev_len = log_last_index t.logs in
-            log_truncate t arg.prev_log_index ;
-            log_concat t.logs arg.entries ;
-            L.debug "%a: Growing logs from %d to %d entries" print t prev_len (log_last_index t.logs) ;
-            t.info.last_leader <- arg.RPC_Server_Types.AppendEntries.leader_id ;
-            let new_commit_index =
-                if arg.leader_commit > t.info.commit_index then
-                    min arg.leader_commit (log_last_index t.logs)
-                else t.info.commit_index in
-            (* We always apply what's committed *)
-            for i = t.info.commit_index+1 to new_commit_index do
-                verbose_apply t i apply ;
-                t.info.commit_index <- i ;
-            done ;
-            answer ~dest:arg.leader_id t true
+                answer ~dest:arg.leader_id ~reason t false
+            else (
+                let prev_len = log_last_index t.logs in
+                (* all is good, try to append all new entries, truncating my logs if we notice an entry is wrong *)
+                for i = 1 to Array.length arg.entries do
+                    let idx = arg.prev_log_index + i in
+                    match log_at_opt t.logs idx with
+                    | Some entry ->
+                        if arg.entries.(i-1).append_term <> entry.term then (
+                            (* delete the existing entry and all that follow it *)
+                            log_truncate t (idx-1) ;
+                            log_append t.logs arg.entries.(i-1).append_command arg.entries.(i-1).append_term ignore
+                        )
+                    | None ->
+                        log_append t.logs arg.entries.(i-1).append_command arg.entries.(i-1).append_term ignore
+                done ;
+                t.info.last_leader <- arg.RPC_Server_Types.AppendEntries.leader_id ;
+                let new_commit_index =
+                    if arg.leader_commit > t.info.commit_index then
+                        let index_of_last_new_entry = arg.prev_log_index + Array.length arg.entries in
+                        min arg.leader_commit index_of_last_new_entry
+                    else t.info.commit_index in
+                t.info.commit_index <- new_commit_index ;
+                L.debug "%a: Growing logs from %d to %d entries, commit_index=%d" print t prev_len (log_last_index t.logs) new_commit_index ;
+                answer ~dest:arg.leader_id t true
+            )
 
         (* Send the entries to every other peers *)
         let append_entries ?(force=false) t peers_info =
@@ -285,7 +340,7 @@ struct
                    (force || now -. info.last_sent > heartbeat_timeout) then (
                     info.in_flight <- true ;
                     info.last_sent <- now ;
-                    let entries = log_from t.logs info.next_index in
+                    let entries = append_log_from t.logs info.next_index in
                     let arg =
                         let open RPC_Server_Types.AppendEntries in
                         let prev_log_index = info.next_index-1 in
@@ -307,10 +362,12 @@ struct
                             if res.success then (
                                 (* This peer received all our log *)
                                 info.next_index <- info.next_index + Array.length arg.entries ; (* incr from what he received *)
-                                info.match_index <- info.next_index - 1
+                                info.match_index <- info.next_index - 1 ;
+                                L.debug "%a: Received ack from %s, next_index will be %d" print t (Host.to_string peer) info.next_index
                             ) else (
                                 (* The peer could find where to attach that *)
-                                info.next_index <- info.next_index - 1
+                                info.next_index <- info.next_index - 1 ;
+                                L.debug "%a: Received nack from %s, next_index will be %d" print t (Host.to_string peer) info.next_index
                                 (* TODO: retry faster *)
                             )
                         | Timeout | Err _ ->
@@ -370,17 +427,6 @@ struct
                 convert_to_follower t
             )
 
-        let is_committed t peers_info log_idx =
-            let nb_res = ref 1 in (* at least me *)
-            let has_quota () = !nb_res > (nb_peers t + 1) / 2 in
-            try Hashtbl.iter (fun _ info ->
-                    if info.match_index >= log_idx then (
-                        incr nb_res ;
-                        if has_quota () then raise Exit
-                    )) peers_info ;
-                has_quota ()
-            with Exit -> true
-
         let is_leader t = match t.info.state with Leader _ -> true | _ -> false
 
         let pub_of_raft (h : Host.t) = { h with port = h.port - 1 }
@@ -398,7 +444,7 @@ struct
             Event.register_timeout (fun _handler ->
                 let now = Unix.gettimeofday () in
                 let time_isolated = now -. t.info.last_recvd_from_leader in
-                match t.info.state with
+                (match t.info.state with
                 | Follower ->
                     if time_isolated > t.info.election_timeout then (
                         L.debug "%a: Timeouting (isolated for %gs)" print t time_isolated ;
@@ -410,42 +456,23 @@ struct
                         convert_to_candidate t
                     )
                 | Leader peers_info ->
+                    try_commit t peers_info ;
                     (* heartbeat *)
                     L.debug "%a: Heartbeat" print t ;
-                    append_entries t peers_info
-            ) ;
+                    append_entries t peers_info) ;
+                try_apply t apply) ;
             RPC_ClientServers.serve pub_host (fun write cmd ->
                 match cmd with
                 | ChangeState command ->
                     (match t.info.state with
                     | Leader peers_info ->
                         (* Leaders: if command received from client: append entry to local log, *)
-                        let new_entry = { command ; term = t.info.current_term } in
-                        let new_entry_idx = log_append t.logs new_entry in
-                        (* ...then issues AppendEntries in parallel to each of the other servers to
+                        log_append t.logs command t.info.current_term write ;
+                        let new_entry_idx = log_last_index t.logs in
+                        L.debug "%a: Received new command %a for index %d (commit_index=%d)" print t Command.print command new_entry_idx t.info.commit_index ;
+                        (* issues AppendEntries in parallel to each of the other servers to
                          * replicate the entry. *)
-                        append_entries ~force:nodelay_replication t peers_info ;
-                        (* We have no idea when this will be committed, maybe only after several retries?
-                         * So we enter a specific condition for every new entry, that's easy to check
-                         * (if not fast) *)
-                        Event.condition
-                            (fun () ->
-                                t.info.commit_index = new_entry_idx - 1 && (* since commit_index increase 1 by 1 on server, by construction below *)
-                                is_committed t peers_info new_entry_idx)
-                            (fun () ->
-                                L.debug "%a: Entry %d is committed" print t new_entry_idx ;
-                                (* When the entry has been committed the leader
-                                 * applies the entry to its state machine and returns the result of that
-                                 * execution to the client. *)
-                                (* only do this if I'm still Leader *)
-                                if is_leader t then (
-                                    t.info.commit_index <- new_entry_idx ;
-                                    let res = verbose_apply t new_entry_idx apply in
-                                    write (State (new_entry_idx, res))
-                                ) else (
-                                    L.debug "%a: Too bad I'm not leader anymore :(" print t ;
-                                    redirect t write
-                                ))
+                        append_entries ~force:nodelay_replication t peers_info
                     | _ ->
                         L.debug "%a: Received a command while I'm not the leader, redirecting to %s" print t (Host.to_string t.info.last_leader) ;
                         redirect t write)
@@ -468,7 +495,7 @@ struct
                         may_become_follower t arg.term ;
                         if t.info.state = Candidate && arg.term = t.info.current_term then
                             convert_to_follower t ;
-                        write (answer_append_entries t apply arg)
+                        write (answer_append_entries t arg)
                     ))
     end
 
@@ -552,3 +579,14 @@ struct
             retry 0 0
     end
 end
+
+(* FIXME:
+ * Leader1 recoit command C, append_entry a tout le monde, mais pendant que cette entree se replique
+ * un candidat prend la place de Leader1, qui ne peut donc submiter cette entree, et donc confirmer au
+ * client. Au lieu de cela il redirige le client vers le nouveau Leader.
+ * Leader2 possede l'entree C, mais elle n'a jamais ete submittee encore.
+ * Le client resoumet la commande C a Leader2, qui l'accepte en nouvelle entree (on a donc alors deux
+ * entrees pour la commande C a ce moment la.
+ * Et les commits ne progresseront plus puisque la premiere commande C ne sera jamais repliquee completement.
+ * Relire le papier!
+ * *)
