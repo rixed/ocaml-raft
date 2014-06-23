@@ -48,7 +48,7 @@ let select_once max_timeout handlers =
     (* Notice: we timeout the select after a max_timeout so that handlers have a chance to implement timeouting *)
     try let changed_files = select rfiles wfiles efiles timeout in
         (* alerts go first (take care that alert can add alerts and so on) *)
-        let latest_alert = Unix.gettimeofday () +. 0.01 in
+        let latest_alert = Unix.gettimeofday () +. 0.001 in
         let rec next_alert () =
             if AlertHeap.size !alerts > 0 then (
                 let t, f = AlertHeap.find_min !alerts in
@@ -75,6 +75,7 @@ let register handler =
     handlers := handler :: !handlers ;
     L.debug "Registering a new handler, now got %d" (List.length !handlers)
 
+(* TODO: give current time to timeout handlers *)
 let register_timeout f =
     let handler = { register_files = identity ;
                     process_files = fun handler _files -> f handler } in
@@ -105,14 +106,14 @@ end
 module type IOType =
 sig
     include BaseIOType
-    type read_result = Value of t_read | Timeout | EndOfFile
+    type read_result = Value of t_read | Timeout of float | EndOfFile
     type write_cmd = Write of t_write | Close
 end
 
 module MakeIOType (B : BaseIOType) : IOType with type t_read = B.t_read and type t_write = B.t_write =
 struct
     include B
-    type read_result = Value of t_read | Timeout | EndOfFile
+    type read_result = Value of t_read | Timeout of float | EndOfFile
     type write_cmd = Write of t_write | Close
 end
 
@@ -155,15 +156,18 @@ struct
             let rec read_next content ofs =
                 let len = String.length content - ofs in
                 L.debug "Still %d bytes to read from buffer" len ;
-                (* If we have no room for Marshal header then it's too early to read anything *)
-                if len < Marshal.header_size then ofs else
-                let value_len = Marshal.header_size + Marshal.data_size content ofs in
+                (* If we have no room for Pdu header then it's too early to read anything *)
+                if len < Pdu.header_size then ofs else
+                let value_len = Pdu.header_size + Pdu.data_size content ofs in
                 if len < value_len then ofs else (
-                    (* Otherwise use this header to find out data size
-                     * Note: data size does not include header size *)
-                    let v = Marshal.from_string content ofs in
-                    value_cb writer (T.Value v) ;
-                    read_next content (ofs + value_len)
+                    match Pdu.from_string content ofs with
+                    | Some (ofs, next_ofs) ->
+                        let v = Marshal.from_string content ofs in
+                        value_cb writer (T.Value v) ;
+                        read_next content next_ofs
+                    | None ->
+                        L.error "Cannot decode command, ignoring %d bytes" value_len ;
+                        read_next content (ofs + value_len)
                 ) in
             let content = Buffer.contents buf in
             Buffer.clear buf ;
@@ -172,7 +176,7 @@ struct
             false
         )
 
-    let start ?timeout infd outfd value_cb =
+    let start ?cnx_timeout infd outfd value_cb =
         let last_used = ref 0. in (* for timeouting *)
         let reset_timeout_and f x =
             last_used := Unix.gettimeofday () ;
@@ -185,6 +189,7 @@ struct
             match c with
             | T.Write v ->
                 Marshal.to_string v [] |>
+                Pdu.make |>
                 Buffer.add_string outbuf
             | T.Close ->
                 if !close_out = Nope then close_out := ToDo in
@@ -209,12 +214,12 @@ struct
             if List.mem outfd wfiles then (
                 if not (buffer_is_empty outbuf) then
                     try_write_buf outbuf outfd) ;
-            Option.may (fun timeout ->
+            Option.may (fun cnx_timeout ->
                 let now = Unix.gettimeofday () in
-                if now -. !last_used > timeout then (
-                    last_used := now ; (* reset timeout *)
-                    value_cb writer Timeout))
-                timeout ;
+                if now -. !last_used > cnx_timeout then (
+                    last_used := now ; (* reset cnx_timeout *)
+                    value_cb writer (Timeout now)))
+                cnx_timeout ;
             if !close_out = ToDo then (
                 L.debug "Closing outfd" ;
                 Unix.close outfd ;
@@ -237,7 +242,7 @@ sig
      * 1 return values.
      * When timeouting, [reader] will be called with [EndOfFile] and input stream will be closed. You must
      * still close output stream if you want to close the socket for good. *)
-    val client : ?timeout:float -> string -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (T.write_cmd -> unit)
+    val client : ?cnx_timeout:float -> string -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (T.write_cmd -> unit)
 end =
 struct
     module BIO = BufferedIO (T)
@@ -254,9 +259,9 @@ struct
                 L.debug "Cannot connect: %s" (Printexc.to_string exn) ;
                 None)
 
-    let client ?timeout host service buf_reader =
+    let client ?cnx_timeout host service buf_reader =
         try let fd = connect host service in
-            BIO.start ?timeout fd fd buf_reader
+            BIO.start ?cnx_timeout fd fd buf_reader
         with Not_found ->
             failwith ("Cannot connect to "^ host ^":"^ service)
 end
@@ -265,7 +270,7 @@ module TcpServer (T : IOType) :
 sig
     (* [serve service callback] listen on port [service] and serve each query with [callback].
      * A shutdown function is returned that will stop the server from accepting new connections. *)
-    val serve : ?timeout:float -> ?max_accepted:int -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (unit -> unit)
+    val serve : ?cnx_timeout:float -> ?max_accepted:int -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (unit -> unit)
 end =
 struct
     module BIO = BufferedIO (T)
@@ -284,7 +289,7 @@ struct
         | [] ->
             failwith ("Cannot listen to "^ service)
 
-    let serve ?timeout ?max_accepted service value_cb =
+    let serve ?cnx_timeout ?max_accepted service value_cb =
         let accepted = ref 0 in
         Option.may (fun n -> assert (n > 0)) max_accepted ;
         let listen_fd = listen service in
@@ -304,7 +309,7 @@ struct
                 (match max_accepted with
                     | Some n when !accepted >= n -> stop_listening ()
                     | _ -> ()) ;
-                let _buf_writer = BIO.start ?timeout client_fd client_fd value_cb in
+                let _buf_writer = BIO.start ?cnx_timeout client_fd client_fd value_cb in
                 ()
             )
         and handler = { register_files ; process_files } in

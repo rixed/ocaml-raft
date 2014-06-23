@@ -22,13 +22,15 @@ struct
 
         (* Retriable errors will be retried *)
         type rpc_res = Ok of Types.ret
+                     | Timeout
                      | Err of string
 
         (* We favor event driven programming here *)
-        val call : Host.t -> Types.arg -> (rpc_res -> unit) -> unit
+        val call : ?timeout:float -> Host.t -> Types.arg -> (rpc_res -> unit) -> unit
         (* TODO: a call_multiple that allows several answers to be received. Useful to 
          * implement pubsub *)
 
+        (* TODO: add the timeout callback here so that we can call it only when the fd is empty *)
         val serve : Host.t -> ((Types.ret -> unit) -> Types.arg -> unit) -> unit
     end
 

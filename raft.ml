@@ -33,10 +33,13 @@ struct
     type log_entry =
         { command : Command.t (* command for the state machine *) ;
           term : term_id (* when it was received *) }
+    let log_entry_print fmt entry =
+        Printf.fprintf fmt "{command=%a, term=%d}" Command.print entry.command entry.term
 
     type peer_info = { mutable next_index : int (* index of the next log entry to send there *) ;
                        mutable match_index : int (* index of highest log entry known to be replicated there *) ;
-                       mutable last_sent : float (* when we last sent entries there *) }
+                       mutable last_sent : float (* when we last sent entries there *) ;
+                       mutable in_flight : bool (* do we have a previous append_entries going on? *) }
 
     type leader_t = (Host.t, peer_info) Hashtbl.t
     type state = Follower | Candidate | Leader of leader_t
@@ -116,7 +119,7 @@ struct
                     rv.term rv.last_log_index rv.last_log_term
             | RPC_Server_Types.AppendEntries ae ->
                 let open RPC_Server_Types.AppendEntries in
-                Printf.fprintf fmt "AppendEntries(nb_entries=%d)" (Array.length ae.entries)
+                Printf.fprintf fmt "AppendEntries(nb_entries=%d@%d)" (Array.length ae.entries) (ae.prev_log_index+1)
 
         let init_follower host peers =
             { info = { state = Follower ;
@@ -138,7 +141,7 @@ struct
         (* raises Invalid_argument all kind of exception if idx is bogus *)
         let log_at logs idx =
             DynArray.get logs (idx - 1 (* first index is 1 *))
-        let log_at_option logs idx =
+        let log_at_opt logs idx =
             try Some (log_at logs idx)
             with DynArray.Invalid_arg _ -> None
         (* Return the list of logs starting at a given index *)
@@ -153,15 +156,21 @@ struct
             DynArray.length logs (* first index is 1 *)
         let log_last_index logs =
             DynArray.length logs
+        let log_truncate t n =
+            t.logs <- DynArray.sub t.logs 0 n
+        let log_concat logs arr =
+            DynArray.append (DynArray.of_array arr) logs
 
         let reset_election_timeout t =
             let now = Unix.gettimeofday () in
-            L.debug "%a: Resetting election timeout to %a" print t Log.date now ;
+            (*L.debug "%a: Resetting election timeout to %a" print t Log.date now ;*)
             t.info.last_recvd_from_leader <- now
             
         let convert_to_follower t =
-            L.debug "%a: Converting to Follower" print t ;
-            t.info.state <- Follower ;
+            if t.info.state <> Follower then (
+                L.debug "%a: Converting to Follower" print t ;
+                t.info.state <- Follower ;
+            ) ;
             t.info.election_timeout <- random_election_timeout () ;
             reset_election_timeout t
 
@@ -176,6 +185,8 @@ struct
                         t.info.voted_for <- None ;
                         convert_to_follower t
                     )
+                | Timeout ->
+                    L.error "%a: Timeouting call %s for %a" print t (Host.to_string peer) print_arg arg
                 | Err err ->
                     L.debug "%a: Received Error %s" print t err) ;
                 k res)
@@ -217,7 +228,7 @@ struct
             if grant then t.info.voted_for <- Some arg.candidate_id ;
             answer ~dest:arg.candidate_id ~reason t grant
 
-        let log_and_apply t i apply =
+        let verbose_apply t i apply =
             let l = log_at t.logs i in
             L.debug "%a: Applying (%d,%a,%d)" print t i Command.print l.command l.term ;
             apply l.command
@@ -229,59 +240,33 @@ struct
             let open RPC_Server_Types.AppendEntries in
             (* Reply false if term < currentTerm *)
             if arg.term < t.info.current_term then answer ~dest:arg.leader_id ~reason:"Too old to be a leader" t false else
-            (* Reply false if log doesn't contain an entry at prev_log_index whose term matches prev_log_term *)
+            (* Reply false if log doesn't contain an entry at prev_log_index *)
+            if arg.prev_log_index > log_last_index t.logs then
+                let reason = Printf.sprintf "I have no entry at pos %d (my last log index is %d)"
+                    arg.prev_log_index (log_last_index t.logs) in
+                answer ~dest:arg.leader_id ~reason t false else
+            (* or if this entry term does not match prev_log_term *)
             if arg.prev_log_index > 0 &&
-               (match log_at_option t.logs arg.prev_log_index with
-                | Some log -> log.term <> arg.prev_log_term
-                | _ -> true) then (
-                answer ~dest:arg.leader_id ~reason:"I'm missing the previous log" t false
-            ) else
-            (* If an existing entry conflicts with a new one (same index but different terms),                 
-             * delete the existing entry and all that follow it *)
-            (* FIXME: I'm ugly please kill me *)
-            let rec aux new_logs_rev idx (to_append : log_entry list) logs =
-                match to_append with
-                | [] -> (* we are done *)
-                    true, List.rev new_logs_rev
-                | new_e::to_append' ->
-                    (match logs with
-                    | [] -> (* no more logs, append what we have *)
-                        if idx > arg.prev_log_index then
-                            true, List.rev_append new_logs_rev to_append
-                        else false, [] (* arg was bogus *)
-                    | e::logs' ->
-                        if idx < arg.prev_log_index then
-                            aux (e::new_logs_rev) (idx+1) to_append logs'
-                        else if idx = arg.prev_log_index then (
-                            if e.term <> arg.prev_log_term then
-                                false, []
-                            else
-                                aux (e::new_logs_rev) (idx+1) to_append logs'
-                        ) else ( (* idx > arg.prev_log_index *)
-                            if e.term <> arg.prev_log_term then
-                                aux new_logs_rev idx to_append []
-                            else
-                                aux (new_e::new_logs_rev) (idx+1) to_append' logs
-                        )
-                    ) in
-            let success, new_logs =
-                aux [] 1 (Array.to_list arg.entries) (DynArray.to_list t.logs) in
-            if not success then answer ~dest:arg.leader_id t false
-            else (
-                t.info.last_leader <- arg.RPC_Server_Types.AppendEntries.leader_id ;
-                let new_logs = DynArray.of_list new_logs in
-                let new_commit_index =
-                    if arg.leader_commit > t.info.commit_index then
-                        min arg.leader_commit (DynArray.length new_logs)
-                    else t.info.commit_index in
-                t.logs <- new_logs ;
-                (* We always apply what's committed *)
-                for i = t.info.commit_index+1 to new_commit_index do
-                    log_and_apply t i apply
-                done ;
-                t.info.commit_index <- new_commit_index ;
-                answer ~dest:arg.leader_id t true
-            )
+               arg.prev_log_term <> (Option.get (log_at_opt t.logs arg.prev_log_index)).term then
+                let reason = Printf.sprintf "my previous entry at pos %d was not term %d"
+                                arg.prev_log_index arg.prev_log_term in
+                answer ~dest:arg.leader_id ~reason t false else
+            (* all is good, truncate my logs after prev_log_term and append new entries *)
+            let prev_len = log_last_index t.logs in
+            log_truncate t arg.prev_log_index ;
+            log_concat t.logs arg.entries ;
+            L.debug "%a: Growing logs from %d to %d entries" print t prev_len (log_last_index t.logs) ;
+            t.info.last_leader <- arg.RPC_Server_Types.AppendEntries.leader_id ;
+            let new_commit_index =
+                if arg.leader_commit > t.info.commit_index then
+                    min arg.leader_commit (log_last_index t.logs)
+                else t.info.commit_index in
+            (* We always apply what's committed *)
+            for i = t.info.commit_index+1 to new_commit_index do
+                verbose_apply t i apply ;
+                t.info.commit_index <- i ;
+            done ;
+            answer ~dest:arg.leader_id t true
 
         (* Send the entries to every other peers *)
         let append_entries ?(force=false) t peers_info =
@@ -291,28 +276,34 @@ struct
                     | None -> (* create this info *)
                         Some { next_index = log_last_index t.logs + 1 ;
                                match_index = 0 ;
-                               last_sent = now }
+                               last_sent = now ;
+                               in_flight = false }
                     | x -> x)
                     peers_info ;
                 let info = Hashtbl.find peers_info peer in
-                let entries = log_from t.logs info.next_index in
-                if force || now -. info.last_sent > heartbeat_timeout then (
+                if not info.in_flight && 
+                   (force || now -. info.last_sent > heartbeat_timeout) then (
+                    info.in_flight <- true ;
                     info.last_sent <- now ;
+                    let entries = log_from t.logs info.next_index in
                     let arg =
                         let open RPC_Server_Types.AppendEntries in
+                        let prev_log_index = info.next_index-1 in
                         let prev_log_term =
-                            if info.next_index > 1 then (
-                                let prev_log = log_at t.logs (info.next_index-1) in
+                            if prev_log_index > 0 then (
+                                let prev_log = log_at t.logs prev_log_index in
                                 prev_log.term
                             ) else 0 in
                         { term = t.info.current_term ;
                           leader_id = t.info.host ;
-                          prev_log_index = info.next_index-1 ;
+                          prev_log_index ;
                           prev_log_term ;
                           entries ;
                           leader_commit = t.info.commit_index } in
                     call_server t peer (RPC_Server_Types.AppendEntries arg) (function
                         | Ok res ->
+                            assert info.in_flight ;
+                            info.in_flight <- false ;
                             if res.success then (
                                 (* This peer received all our log *)
                                 info.next_index <- info.next_index + Array.length arg.entries ; (* incr from what he received *)
@@ -322,8 +313,9 @@ struct
                                 info.next_index <- info.next_index - 1
                                 (* TODO: retry faster *)
                             )
-                        | Err err ->
-                            L.error "%a: Cannot append entries to %s: %s" print t (Host.to_string peer) err)
+                        | Timeout | Err _ ->
+                            L.error "%a: Cannot append entries to %s" print t (Host.to_string peer) ;
+                            (* TODO: close? *))
                 )
             ) t.info.peers
 
@@ -343,6 +335,7 @@ struct
             t.info.election_timeout <- random_election_timeout () ;
             reset_election_timeout t ;
             (* Request a vote *)
+            if t.info.peers = [] then convert_to_leader t else
             let nb_wins = ref 1 (* I vote for myself (see above) *) in
             let last_log_index = log_last_index t.logs in
             let last_log_term =
@@ -367,7 +360,7 @@ struct
                            t.info.current_term = term && (* for *this* election *)
                            !nb_wins > (nb_peers t + 1) / 2
                         then convert_to_leader t
-                    | Err _err -> ()))
+                    | Timeout | Err _ -> ()))
 
         let may_become_follower t peer_term =
             if peer_term > t.info.current_term then (
@@ -379,12 +372,13 @@ struct
 
         let is_committed t peers_info log_idx =
             let nb_res = ref 1 in (* at least me *)
+            let has_quota () = !nb_res > (nb_peers t + 1) / 2 in
             try Hashtbl.iter (fun _ info ->
                     if info.match_index >= log_idx then (
                         incr nb_res ;
-                        if !nb_res > (nb_peers t + 1) / 2 then raise Exit
+                        if has_quota () then raise Exit
                     )) peers_info ;
-                false
+                has_quota ()
             with Exit -> true
 
         let is_leader t = match t.info.state with Leader _ -> true | _ -> false
@@ -417,6 +411,7 @@ struct
                     )
                 | Leader peers_info ->
                     (* heartbeat *)
+                    L.debug "%a: Heartbeat" print t ;
                     append_entries t peers_info
             ) ;
             RPC_ClientServers.serve pub_host (fun write cmd ->
@@ -445,7 +440,7 @@ struct
                                 (* only do this if I'm still Leader *)
                                 if is_leader t then (
                                     t.info.commit_index <- new_entry_idx ;
-                                    let res = log_and_apply t new_entry_idx apply in
+                                    let res = verbose_apply t new_entry_idx apply in
                                     write (State (new_entry_idx, res))
                                 ) else (
                                     L.debug "%a: Too bad I'm not leader anymore :(" print t ;
@@ -454,7 +449,9 @@ struct
                     | _ ->
                         L.debug "%a: Received a command while I'm not the leader, redirecting to %s" print t (Host.to_string t.info.last_leader) ;
                         redirect t write)
-                | QueryInfo -> write (Info t.info)) ;
+                | QueryInfo ->
+                    L.debug "%a: Must send infos" print t ;
+                    write (Info t.info)) ;
             RPC_Servers.serve raft_host (fun write cmd ->
                 match cmd with
                 | RequestVote arg ->
@@ -498,46 +495,60 @@ struct
         let make name servers =
             { name ; servers ; leader = random_leader servers }
 
-        let max_nb_try = 5
-
-        let info t host k =
-            RPC_ClientServers.call host QueryInfo (function
+        let info ?(timeout=0.5) t host k =
+            RPC_ClientServers.call ~timeout host QueryInfo (function
                 | Ok (Info info) -> k info
                 | Ok _ ->
                     L.debug "%a: server %s answering with state not infos" print t (Host.to_string host)
+                | Timeout ->
+                    L.error "%a: Timeouting getinfo to %s" print t (Host.to_string host)
                 | Err x ->
-                    L.debug "%a: Can't get infos from %s: %s" print t (Host.to_string host) x)
+                    L.error "%a: Can't get infos from %s: %s" print t (Host.to_string host) x)
 
-        let call t x k =
-            let rec retry nb_try =
-                L.debug "%a: Sending command to %s after %d tries" print t (Host.to_string t.leader) nb_try ;
-                if nb_try > max_nb_try then failwith "Too many retries" ;
-                let sent_to = t.leader in (* so that we can compare with redirection even after changing t.leader *)
-                RPC_ClientServers.call t.leader (ChangeState x) (function
-                    | Ok (State (log_index, state)) ->
-                        L.debug "%a: Ack for (%d,%a)" print t log_index Command.print x ;
-                        k state
-                    | Ok (Redirect leader') ->
-                        L.debug "%a: Was told by %s to redirect to %s" print t (Host.to_string sent_to) (Host.to_string leader') ;
-                        t.leader <-
-                            if leader' <> sent_to then leader' else
-                            (* The server do not know who is the leader yet *)
-                            if t.leader <> sent_to then t.leader else (
-                                (* And I still don't know neither: try one at random *)
-                                let l = until_diff t.leader (fun () -> random_leader t.servers) in
-                                L.debug "%a: Will redirect to %s instead" print t (Host.to_string l) ;
-                                l
-                            ) ;
-                        retry (nb_try+1)
-                    | Ok (Info s) ->
-                        L.debug "%a: server %s sending its status out of the blue?" print t (Host.to_string s.host) ;
-                        assert false (* TODO *)
-                    | Err x ->
-                        L.debug "%a: Can't get state from %s: %s" print t (Host.to_string t.leader) x ;
-                        (* try another server? *)
-                        t.leader <- random_leader t.servers ;
-                        retry (nb_try+1))
+        let call ?(timeout=0.5) t x k =
+            let max_fast_try = Array.length t.servers * 2 in
+            let max_slow_try = 4 in
+            let rec retry nb_fast_try nb_slow_try =
+                L.debug "%a: Sending %a to %s after %d fast, %d slow retries" print t Command.print x (Host.to_string t.leader) nb_fast_try nb_slow_try ;
+                if nb_fast_try > max_fast_try then (
+                    (* There might be an election going on, let's wait a little *)
+                    if nb_slow_try >= max_slow_try then (
+                        failwith "Too many retries"
+                    ) else (
+                        L.debug "%a: Pausing before retrying" print t ;
+                        Event.pause 1. (fun () -> retry 0 (nb_slow_try+1))
+                    )
+                ) else (
+                    let sent_to = t.leader in (* so that we can compare with redirection even after changing t.leader *)
+                    RPC_ClientServers.call ~timeout t.leader (ChangeState x) (function
+                        | Ok (State (log_index, state)) ->
+                            L.debug "%a: Ack for (%d,%a)" print t log_index Command.print x ;
+                            k state
+                        | Ok (Redirect leader') ->
+                            L.debug "%a: Was told by %s to redirect to %s" print t (Host.to_string sent_to) (Host.to_string leader') ;
+                            t.leader <-
+                                if leader' <> sent_to then leader' else
+                                (* The server do not know who is the leader yet *)
+                                if t.leader <> sent_to then t.leader else (
+                                    (* And I still don't know neither: try one at random *)
+                                    let l = until_diff t.leader (fun () -> random_leader t.servers) in
+                                    L.debug "%a: Will redirect to %s instead" print t (Host.to_string l) ;
+                                    l
+                                ) ;
+                            retry (nb_fast_try+1) nb_slow_try
+                        | Ok (Info s) ->
+                            L.debug "%a: server %s sending its status out of the blue?" print t (Host.to_string s.host) ;
+                            assert false (* TODO *)
+                        | Timeout ->
+                            L.error "%a: Timeouting query %a to %s" print t Command.print x (Host.to_string sent_to) ;
+                            retry (nb_fast_try+1) nb_slow_try
+                        | Err x ->
+                            L.error "%a: Can't get state from %s: %s" print t (Host.to_string t.leader) x ;
+                            (* try another server? *)
+                            t.leader <- random_leader t.servers ;
+                            retry (nb_fast_try+1) nb_slow_try)
+                )
             in
-            retry 0
+            retry 0 0
     end
 end

@@ -1,19 +1,24 @@
 open Batteries
 open Raft_intf
 
-module L = Log.Info
+module L = Log.Debug
 
 (* RPC through TCP *)
 
+(* for clarity, have a single id for any kind of TCP *)
+let next_id =
+    let n = ref 0 in
+    fun () -> incr n ; !n
+
 module type TCP_CONFIG =
 sig
-    val timeout : float option
+    val cnx_timeout : float
     val max_accepted : int option
 end
 
 module DefaultTcpConfig : TCP_CONFIG =
 struct
-    let timeout = None
+    let cnx_timeout = 1.
     let max_accepted = None
 end
 
@@ -22,6 +27,7 @@ struct
     module Types = Types
 
     type rpc_res = Ok of Types.ret
+                 | Timeout
                  | Err of string
 
     type id = int
@@ -37,11 +43,11 @@ struct
     open Config
 
     let serve h f =
-        let _shutdown = TcpServer.serve ?timeout ?max_accepted (string_of_int h.Host.port) (fun write input ->
+        let _shutdown = TcpServer.serve ~cnx_timeout ?max_accepted (string_of_int h.Host.port) (fun write input ->
             match input with
             | Srv_IOType.Value (id, v) ->
                 f (fun res -> write (Srv_IOType.Write (id, res))) v
-            | Srv_IOType.Timeout
+            | Srv_IOType.Timeout _
             | Srv_IOType.EndOfFile ->
                 write Srv_IOType.Close) in
         () (* we keep serving until we die *)
@@ -60,22 +66,28 @@ struct
      *   backend). Since the hash of cnx is global and the id is global as well, we can imagine a query
      *   being answered by another server, which is cool or frightening.
      * - as a result, if we store several servers on this program they can share the same cnxs if they
-     *   speack to the same dest, which is very cool!
+     *   speack to the same dest
      *)
     let cnxs = Hashtbl.create 31
     let continuations = Hashtbl.create 72
-    let next_id =
-        let n = ref 0 in
-        fun () -> incr n ; !n
 
-    let call h v k =
+    (* timeout continuations *)
+    let try_timeout id =
+        match  Hashtbl.find_option continuations id with
+        | Some k ->
+            L.debug "Timeouting message id %d" id ;
+            Hashtbl.remove continuations id ;
+            k Timeout
+        | None -> ()
+
+    let call ?(timeout=0.5) h v k =
         let writer =
             match Hashtbl.find_option cnxs h with
             | Some w -> w
             | None ->
                 (* connect to the server *)
                 L.debug "Need a new connection to %s" (Host.to_string h) ;
-                let w = TcpClient.client ?timeout h.Host.name (string_of_int h.Host.port) (fun write input ->
+                let w = TcpClient.client ~cnx_timeout h.Host.name (string_of_int h.Host.port) (fun write input ->
                     match input with
                     | Clt_IOType.Value (id, v) ->
                         (* Note: we can't modify continuations in place because we'd
@@ -89,21 +101,19 @@ struct
                             L.debug "Continuing message id %d" id ;
                             k (Ok v) ;
                             Hashtbl.remove continuations id)
-                    | Clt_IOType.Timeout
+                    | Clt_IOType.Timeout _now -> (* called when the underlying IO had nothing to read for too long *)
+                        ()
                     | Clt_IOType.EndOfFile ->
-                        (* notify all continuations *)
-                        Hashtbl.filteri_inplace (fun id k ->
-                            L.debug "Expiring termination for message id %d" id ;
-                            k (Err "Connection closed") ;
-                            false) continuations ;
+                        (* since we don't know which messages were sent via this cnx, rely on timeout to notify continuations *)
+                        L.info "Closing cnx to %s" (Host.to_string h) ;
                         write Close ;
                         Hashtbl.remove cnxs h) in
                 Hashtbl.add cnxs h w ;
                 w in
         let id = next_id () in
+        L.debug "Saving continuation for message id %d" id ;
+        Event.pause timeout (fun () -> try_timeout id) ;
         Hashtbl.add continuations id k ;
-        L.debug "Saving continuation for message id %d (147 %s there)" id
-            (if Hashtbl.mem continuations 147 then "still" else "NOT") ;
         writer (Write (id, v))
 
 end

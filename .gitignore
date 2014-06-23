@@ -12,7 +12,7 @@
 *.s
 *.top
 *.cgi
-*.log
+*log
 nohup.out
 all_tests.ml
 /Makefile

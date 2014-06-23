@@ -1,6 +1,7 @@
 (* Tests *)
 open Batteries
 open Raft_intf
+module L = Log.Debug
 
 (* Check TcpClient *)
 
@@ -22,17 +23,17 @@ struct
         let service_port = "31142" in
         let stop_listening = ref ignore in
         let server w = function
-            | SrvT.Timeout
+            | SrvT.Timeout _
             | SrvT.EndOfFile ->
                 w SrvT.Close ;
                 !stop_listening ()
             | SrvT.Value s ->
-                Log.debug "Serving string.length for str='%s'" s ;
+                L.debug "Serving string.length for str='%s'" s ;
                 SrvT.Write (String.length s) |> w in
         stop_listening := Srv.serve service_port server ;
         let send = Clt.client "localhost" service_port (fun _w res ->
             match res with
-            | CltT.Timeout
+            | CltT.Timeout _
             | CltT.EndOfFile -> () (* we already closed at the beginning *)
             | CltT.Value l ->
                 OUnit2.assert_equal l (String.length tests.(!idx)) ;
@@ -55,19 +56,19 @@ struct
     let host = Host.make "localhost" 21743
 
     let () =
-        let f (a, b) = String.of_int (a+b) in
+        let f w (a, b) = String.of_int (a+b) |> w in
         RPC.serve host f
 
     let checks () =
         RPC.call host (0, 1) (fun r ->
-            Log.debug "Test RPC(0,1)" ;
+            L.debug "Test RPC(0,1)" ;
             OUnit2.assert_equal r (Ok "1")) ;
         RPC.call host (2, 3) (fun r ->
-            Log.debug "Test RPC(2,3)" ;
+            L.debug "Test RPC(2,3)" ;
             OUnit2.assert_equal r (Ok "5") ;
             (* And we can call an RPC from an answer *)
             RPC.call host (4, 5) (fun r ->
-                Log.debug "Test RPC(4,5)" ;
+                L.debug "Test RPC(4,5)" ;
                 OUnit2.assert_equal r (Ok "9")))
 end
 
@@ -75,10 +76,10 @@ let () =
     let module TcpConfig =
         struct
             include Rpc.DefaultTcpConfig
-            let timeout = Some 0.2
+            let cnx_timeout = 0.2
             let max_accepted = Some 1
         end in
-    let module R = RPC_Checks(Rpc.Tcp(TcpConfigForTests)) in R.checks () ;
+    let module R = RPC_Checks(Rpc.Tcp(TcpConfig)) in R.checks () ;
     Tcp_Checks.checks () ;
     Event.loop ()
 

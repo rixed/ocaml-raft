@@ -43,4 +43,3 @@ struct
     let error = log
 end
 
-include Info (* default *)

@@ -41,7 +41,7 @@ end
 module TestClient = Raft_impl.Client
 
 let main =
-    let nb_servers = 9 and nb_clients = 20 and nb_msgs = 100 in
+    let nb_servers = 5 and nb_clients = 5 and nb_msgs = 100 in
     let servers = Array.init nb_servers (fun _ -> Host.make "localhost" (Random.int 64510 + 1024)) in
     Array.iter (fun s ->
         (* peers = list of all servers but s *)
@@ -78,6 +78,6 @@ let main =
         (fun () -> !nb_tests = 1 + Array.length clients)
         (fun () ->
             (* Wait a little bit more for raft servers to apply everything *)
-            Event.pause (3. *. et) (fun () -> Event.clear ())) ;
+            Event.pause 1. (fun () -> Event.clear ())) ;
     Event.loop ~timeout:(0.1 *. et) ()
 

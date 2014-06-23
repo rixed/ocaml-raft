@@ -3,12 +3,13 @@ top_srcdir = @top_srcdir@
 PKG_NAME = raft
 SOURCES  = \
 	log.ml \
+	pdu.ml \
 	event.ml \
 	raft_intf.ml \
 	rpc.ml \
 	raft.ml
 
-EXAMPLES_BYTE =
+EXAMPLES_BYTE = fungw.byte
 
 REQUIRES = batteries oUnit
 
@@ -33,7 +34,7 @@ raft.top: $(ARCHIVE)
 run: raft.top
 	rlwrap ./raft.top -init raft.init
 
-TEST_PROGRAMS = raft_check.ml
+TEST_PROGRAMS = check.ml raft_check.ml
 check.cmo: $(ARCHIVE)
 raft_check.cmo: $(ARCHIVE)
 check-spec: $(TEST_PROGRAMS:.ml=.opt)
