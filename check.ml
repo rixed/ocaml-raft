@@ -13,10 +13,12 @@ struct
         type t_read = int
     end
     (* We simulate a 'string-length' service: client sends string and read their length *)
-    module CltT = Event.MakeIOType (BaseIOType)
-    module SrvT = Event.MakeIOTypeRev (BaseIOType)
-    module Clt = Event.TcpClient (CltT)
-    module Srv = Event.TcpServer (SrvT)
+    module CltT = MakeIOType (BaseIOType)
+    module Clt_Pdu = Pdu.Marshaller(CltT)
+    module Clt = Event.TcpClient (CltT) (Clt_Pdu)
+    module SrvT = MakeIOTypeRev (BaseIOType)
+    module Srv_Pdu = Pdu.Marshaller(SrvT)
+    module Srv = Event.TcpServer (SrvT) (Srv_Pdu)
     let checks () =
         let idx = ref 0 in
         let tests = [| "hello" ; "glop" ; "" |] in
@@ -53,7 +55,7 @@ struct
     end
     module RPC = RPC_Maker (RPC_Types)
 
-    let host = Host.make "localhost" 21743
+    let host = Server.make "localhost" 21743
 
     let () =
         let f w (a, b) = String.of_int (a+b) |> w in

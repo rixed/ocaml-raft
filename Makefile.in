@@ -11,7 +11,7 @@ SOURCES  = \
 
 EXAMPLES_BYTE = fungw.byte
 
-REQUIRES = batteries oUnit
+REQUIRES = batteries oUnit cmdliner
 
 EXAMPLES_OPT = $(EXAMPLES_BYTE:.byte=.opt)
 EXAMPLES = $(EXAMPLES_BYTE) $(EXAMPLES_OPT)

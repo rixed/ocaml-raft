@@ -1,7 +1,7 @@
 open Batteries
 open Raft_intf
 
-module L = Log.Debug
+module L = Log.Info
 
 (* RPC through TCP *)
 
@@ -37,13 +37,14 @@ struct
         type t_read = id * Types.arg
         type t_write = id * Types.ret
     end
-    module Srv_IOType = Event.MakeIOType(BaseIOType)
-    module TcpServer = Event.TcpServer(Srv_IOType)
+    module Srv_IOType = MakeIOType(BaseIOType)
+    module Srv_Pdu = Pdu.Marshaller(Srv_IOType)
+    module TcpServer = Event.TcpServer(Srv_IOType)(Srv_Pdu)
 
     open Config
 
     let serve h f =
-        let _shutdown = TcpServer.serve ~cnx_timeout ?max_accepted (string_of_int h.Host.port) (fun write input ->
+        let _shutdown = TcpServer.serve ~cnx_timeout ?max_accepted (string_of_int h.Server.port) (fun write input ->
             match input with
             | Srv_IOType.Value (id, v) ->
                 f (fun res -> write (Srv_IOType.Write (id, res))) v
@@ -52,8 +53,9 @@ struct
                 write Srv_IOType.Close) in
         () (* we keep serving until we die *)
 
-    module Clt_IOType = Event.MakeIOTypeRev(BaseIOType)
-    module TcpClient = Event.TcpClient(Clt_IOType)
+    module Clt_IOType = MakeIOTypeRev(BaseIOType)
+    module Clt_Pdu = Pdu.Marshaller(Clt_IOType)
+    module TcpClient = Event.TcpClient(Clt_IOType)(Clt_Pdu)
 
     (* Notice that:
      * - the TCP cnx is initialized when first used and then saved for later,
@@ -86,8 +88,8 @@ struct
             | Some w -> w
             | None ->
                 (* connect to the server *)
-                L.debug "Need a new connection to %s" (Host.to_string h) ;
-                let w = TcpClient.client ~cnx_timeout h.Host.name (string_of_int h.Host.port) (fun write input ->
+                L.debug "Need a new connection to %s" (Server.to_string h) ;
+                let w = TcpClient.client ~cnx_timeout h.Server.name (string_of_int h.Server.port) (fun write input ->
                     match input with
                     | Clt_IOType.Value (id, v) ->
                         (* Note: we can't modify continuations in place because we'd
@@ -95,8 +97,7 @@ struct
                          * can itself update the hash. *)
                         (match Hashtbl.find_option continuations id with
                         | None ->
-                            L.error "No continuation for message id %d" id ;
-                            failwith "Invalid incoming message id"
+                            L.error "No continuation for message id %d (already timeouted?)" id
                         | Some k ->
                             L.debug "Continuing message id %d" id ;
                             k (Ok v) ;
@@ -105,7 +106,7 @@ struct
                         ()
                     | Clt_IOType.EndOfFile ->
                         (* since we don't know which messages were sent via this cnx, rely on timeout to notify continuations *)
-                        L.info "Closing cnx to %s" (Host.to_string h) ;
+                        L.info "Closing cnx to %s" (Server.to_string h) ;
                         write Close ;
                         Hashtbl.remove cnxs h) in
                 Hashtbl.add cnxs h w ;

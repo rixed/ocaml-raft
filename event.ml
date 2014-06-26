@@ -1,4 +1,6 @@
 open Batteries
+open Raft_intf
+
 type fd = Unix.file_descr
 
 module L = Log.Info
@@ -83,7 +85,7 @@ let register_timeout f =
 
 let pause delay f =
     let date = Unix.gettimeofday () +. delay in
-    alerts := AlertHeap.add (date, f) !alerts 
+    alerts := AlertHeap.add (date, f) !alerts
 
 let condition cond f =
     conditions := (cond, f)::!conditions
@@ -97,38 +99,8 @@ let clear () =
     alerts := AlertHeap.empty ;
     conditions := []
 
-module type BaseIOType =
-sig
-    type t_read
-    type t_write
-end
-
-module type IOType =
-sig
-    include BaseIOType
-    type read_result = Value of t_read | Timeout of float | EndOfFile
-    type write_cmd = Write of t_write | Close
-end
-
-module MakeIOType (B : BaseIOType) : IOType with type t_read = B.t_read and type t_write = B.t_write =
-struct
-    include B
-    type read_result = Value of t_read | Timeout of float | EndOfFile
-    type write_cmd = Write of t_write | Close
-end
-
-module MakeIOTypeRev (B : BaseIOType) : IOType with type t_read = B.t_write and type t_write = B.t_read =
-struct
-    module BaseIOTypeRev =
-    struct
-        type t_read = B.t_write
-        type t_write = B.t_read
-    end
-    include MakeIOType (BaseIOTypeRev)
-end
-
 (* Buffered reader/writer of marshaled values of type IOType.t_read/IOType.t_write. *)
-module BufferedIO (T : IOType) =
+module BufferedIO (T : IOType) (Pdu : PDU with type BaseIOType.t_read = T.t_read and type BaseIOType.t_write = T.t_write) =
 struct
     let try_write_buf buf fd =
         let str = Buffer.contents buf in
@@ -156,19 +128,14 @@ struct
             let rec read_next content ofs =
                 let len = String.length content - ofs in
                 L.debug "Still %d bytes to read from buffer" len ;
-                (* If we have no room for Pdu header then it's too early to read anything *)
-                if len < Pdu.header_size then ofs else
-                let value_len = Pdu.header_size + Pdu.data_size content ofs in
-                if len < value_len then ofs else (
-                    match Pdu.from_string content ofs with
-                    | Some (ofs, next_ofs) ->
-                        let v = Marshal.from_string content ofs in
-                        value_cb writer (T.Value v) ;
-                        read_next content next_ofs
-                    | None ->
-                        L.error "Cannot decode command, ignoring %d bytes" value_len ;
-                        read_next content (ofs + value_len)
-                ) in
+                (* Do we have enough bytes to read a value? *)
+                (match Pdu.has_value content ofs len with
+                | None -> ofs
+                | Some value_len ->
+                    assert (value_len <= len) ;
+                    Pdu.of_string content ofs value_len |>
+                    Option.may (fun v -> value_cb writer (T.Value v)) ;
+                    read_next content (ofs + value_len)) in
             let content = Buffer.contents buf in
             Buffer.clear buf ;
             let ofs = read_next content 0 in
@@ -188,8 +155,7 @@ struct
             assert (!close_out <> Done) ; (* otherwise why were we been given the possibility to write? *)
             match c with
             | T.Write v ->
-                Marshal.to_string v [] |>
-                Pdu.make |>
+                Pdu.to_string v |>
                 Buffer.add_string outbuf
             | T.Close ->
                 if !close_out = Nope then close_out := ToDo in
@@ -232,7 +198,7 @@ struct
         writer
 end
 
-module TcpClient (T : IOType) :
+module TcpClient (T : IOType) (Pdu : PDU with type BaseIOType.t_read = T.t_read and type BaseIOType.t_write = T.t_write) :
 sig
     (* [client "server.com" "http" reader] connect to server.com:80 and will send all read value to [reader]
      * function. The returned value is the writer function.
@@ -245,7 +211,7 @@ sig
     val client : ?cnx_timeout:float -> string -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (T.write_cmd -> unit)
 end =
 struct
-    module BIO = BufferedIO (T)
+    module BIO = BufferedIO (T) (Pdu)
 
     let connect host service =
         let open Unix in
@@ -266,14 +232,14 @@ struct
             failwith ("Cannot connect to "^ host ^":"^ service)
 end
 
-module TcpServer (T : IOType) :
+module TcpServer (T : IOType) (Pdu : PDU with type BaseIOType.t_read = T.t_read and type BaseIOType.t_write = T.t_write) :
 sig
     (* [serve service callback] listen on port [service] and serve each query with [callback].
      * A shutdown function is returned that will stop the server from accepting new connections. *)
     val serve : ?cnx_timeout:float -> ?max_accepted:int -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (unit -> unit)
 end =
 struct
-    module BIO = BufferedIO (T)
+    module BIO = BufferedIO (T) (Pdu)
 
     let listen service =
         let open Unix in

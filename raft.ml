@@ -8,7 +8,7 @@ type term_id = int
 let election_timeout = 0.225
 let election_timeout_spray = 0.333
 let heartbeat_timeout = 0.1
-let nodelay_replication = false (* true for replicating each command as they are received *)
+let nodelay_replication = true (* true for replicating each command as they are received *)
 let random_election_timeout () =
     let s = election_timeout_spray in
     let r = Random.float (s*.2.) -. s +. 1. in
@@ -35,7 +35,7 @@ struct
                        mutable last_sent : float (* when we last sent entries there *) ;
                        mutable in_flight : bool (* do we have a previous append_entries going on? *) }
 
-    type leader_t = (Host.t, peer_info) Hashtbl.t
+    type leader_t = (Server.t, peer_info) Hashtbl.t
     type state = Follower | Candidate | Leader of leader_t
 
     let string_of_state = function
@@ -45,13 +45,13 @@ struct
 
     type server_info =
         { mutable state : state (* The state I'm currently in *) ;
-          host : Host.t (* myself *) ;
-          peers : Host.t list (* other servers *) ;
+          host : Server.t (* myself *) ;
+          peers : Server.t list (* other servers *) ;
           mutable current_term : term_id (* latest term server has seen (initialized to 0 at startup, increases monotonically) *) ;
-          mutable voted_for : Host.t option (* candidate that received vote in current term (if any) *) ;
+          mutable voted_for : Server.t option (* candidate that received vote in current term (if any) *) ;
           mutable commit_index : int (* index of highest log entry known to be committed *) ;
           mutable last_applied : int (* last index we applied *) ;
-          mutable last_leader : Host.t (* last leader we heard from *) ;
+          mutable last_leader : Server.t (* last leader we heard from *) ;
           mutable last_recvd_from_leader : float (* when we last heard from a leader *) ;
           mutable election_timeout : float }
 
@@ -61,7 +61,7 @@ struct
         type arg = ChangeState of Command.t
                  | QueryInfo (* to a specific host *)
         type ret = State of int * Command.state (* to a ChangeState only *)
-                 | Redirect of Host.t (* to a ChangeState only *)
+                 | Redirect of Server.t (* to a ChangeState only *)
                  | Info of server_info (* to a QueryInfo only *)
     end
     module RPC_ClientServers = RPC_Maker (RPC_ClientServer_Types)
@@ -84,11 +84,11 @@ struct
         { info : server_info ;
           mutable logs : log_entry DynArray.t }
 
-    module Server =
+    module Srv =
     struct
         type t = server
         let print fmt t =
-            Printf.fprintf fmt "%20s@%s, term=%d" (string_of_state t.info.state) (Host.to_string t.info.host) t.info.current_term
+            Printf.fprintf fmt "%20s@%s, term=%d" (string_of_state t.info.state) (Server.to_string t.info.host) t.info.current_term
 
         module RPC_Server_Types =
         struct
@@ -97,7 +97,7 @@ struct
             struct
                 type arg =
                     { term : term_id (* candidate's term *) ;
-                      candidate_id : Host.t (* candidate requesting vote *) ;
+                      candidate_id : Server.t (* candidate requesting vote *) ;
                       last_log_index : int (* index of candidate's last log entry *) ;
                       last_log_term : term_id (* term of candidate's last log entry *) }
             end
@@ -105,7 +105,7 @@ struct
             struct
                 type arg =
                     { term : term_id (* leader's term *) ;
-                      leader_id : Host.t (* so follower can redirect clients *) ;
+                      leader_id : Server.t (* so follower can redirect clients *) ;
                       prev_log_index : int (* index of log entry immediately preceding new ones (FIXME: what if the log was empty?) *) ;
                       prev_log_term : term_id (* term of prev_log_index entry (FIXME: idem) *) ;
                       entries : append_entry array (* log entries to store *) ;
@@ -114,7 +114,7 @@ struct
             type arg = RequestVote of RequestVote.arg
                      | AppendEntries of AppendEntries.arg
 
-            type ret = 
+            type ret =
                 { term : term_id (* current term, for caller to update its state *) ;
                   success : bool (* did candidate received the vote? /
                                         follower already contained entry matching prev_log_{index,term} *) }
@@ -176,7 +176,7 @@ struct
             let now = Unix.gettimeofday () in
             (*L.debug "%a: Resetting election timeout to %a" print t Log.date now ;*)
             t.info.last_recvd_from_leader <- now
-            
+
         let convert_to_follower t =
             if t.info.state <> Follower then (
                 L.debug "%a: Converting to Follower" print t ;
@@ -187,7 +187,7 @@ struct
 
         (* Wrapper that handles common behavior *)
         let call_server t peer arg k =
-            L.debug "%a: Calling %s for %a" print t (Host.to_string peer) print_arg arg ;
+            L.debug "%a: Calling %s for %a" print t (Server.to_string peer) print_arg arg ;
             RPC_Servers.call peer arg (fun res ->
                 (match res with
                 | Ok res ->
@@ -197,7 +197,7 @@ struct
                         convert_to_follower t
                     )
                 | Timeout ->
-                    L.error "%a: Timeouting call %s for %a" print t (Host.to_string peer) print_arg arg
+                    L.error "%a: Timeouting call %s for %a" print t (Server.to_string peer) print_arg arg
                 | Err err ->
                     L.debug "%a: Received Error %s" print t err) ;
                 k res)
@@ -205,7 +205,7 @@ struct
         let answer ?dest ?reason t success =
             L.debug "%a: Answering %s%s%s"
                 print t (if success then (Log.colored true 2 "YES") else (Log.colored false 1 "NO"))
-                (match dest with Some d -> " to "^ Host.to_string d | None -> "")
+                (match dest with Some d -> " to "^ Server.to_string d | None -> "")
                 (match reason with Some r -> " because "^r | None -> "") ;
             { RPC_Server_Types.term = t.info.current_term ; RPC_Server_Types.success = success }
 
@@ -217,7 +217,7 @@ struct
                 (* If voted_for is None or candidate_id, and candidate's log is at least as up-to-date
                  * as receiver's log, grant vote. *)
                 match t.info.voted_for with Some guy when guy <> arg.candidate_id ->
-                      false, "I vote for "^(Host.to_string guy)
+                      false, "I vote for "^(Server.to_string guy)
                 | _ ->
                 (* Up-to-date: If the logs have last entries with different terms, then the log with
                  * the later term is more up to date. If the logs end with the same term, then whichever
@@ -246,17 +246,9 @@ struct
             try Hashtbl.iter (fun _ info ->
                     if info.match_index >= log_idx then (
                         incr nb_res ;
-                        if has_quota () then (
-                            L.debug "quota for submission (%d)!" !nb_res ;
-                            raise Exit
-                        ) else
-                            L.debug "no quota for submission yet (%d)" !nb_res
+                        if has_quota () then raise Exit
                     )) peers_info ;
-                if has_quota () then (
-                    L.debug "quota for submission (%d)!" !nb_res ; true
-                ) else (
-                    L.debug "no quota for submission yet (%d)" !nb_res ; false
-                )
+                false
             with Exit -> true
 
         (* where leaders try to increase their commit_index *)
@@ -336,7 +328,7 @@ struct
                     | x -> x)
                     peers_info ;
                 let info = Hashtbl.find peers_info peer in
-                if not info.in_flight && 
+                if not info.in_flight &&
                    (force || now -. info.last_sent > heartbeat_timeout) then (
                     info.in_flight <- true ;
                     info.last_sent <- now ;
@@ -363,15 +355,15 @@ struct
                                 (* This peer received all our log *)
                                 info.next_index <- info.next_index + Array.length arg.entries ; (* incr from what he received *)
                                 info.match_index <- info.next_index - 1 ;
-                                L.debug "%a: Received ack from %s, next_index will be %d" print t (Host.to_string peer) info.next_index
+                                L.debug "%a: Received ack from %s, next_index will be %d" print t (Server.to_string peer) info.next_index
                             ) else (
                                 (* The peer could find where to attach that *)
                                 info.next_index <- info.next_index - 1 ;
-                                L.debug "%a: Received nack from %s, next_index will be %d" print t (Host.to_string peer) info.next_index
+                                L.debug "%a: Received nack from %s, next_index will be %d" print t (Server.to_string peer) info.next_index
                                 (* TODO: retry faster *)
                             )
                         | Timeout | Err _ ->
-                            L.error "%a: Cannot append entries to %s" print t (Host.to_string peer) ;
+                            L.error "%a: Cannot append entries to %s" print t (Server.to_string peer) ;
                             (* TODO: close? *))
                 )
             ) t.info.peers
@@ -429,8 +421,8 @@ struct
 
         let is_leader t = match t.info.state with Leader _ -> true | _ -> false
 
-        let pub_of_raft (h : Host.t) = { h with port = h.port - 1 }
-        let raft_of_pub (h : Host.t) = { h with port = h.port + 1 }
+        let pub_of_raft (h : Server.t) = { h with port = h.port - 1 }
+        let raft_of_pub (h : Server.t) = { h with port = h.port + 1 }
 
         let redirect t write =
             write (RPC_ClientServer_Types.Redirect (pub_of_raft t.info.last_leader))
@@ -474,7 +466,7 @@ struct
                          * replicate the entry. *)
                         append_entries ~force:nodelay_replication t peers_info
                     | _ ->
-                        L.debug "%a: Received a command while I'm not the leader, redirecting to %s" print t (Host.to_string t.info.last_leader) ;
+                        L.debug "%a: Received a command while I'm not the leader, redirecting to %s" print t (Server.to_string t.info.last_leader) ;
                         redirect t write)
                 | QueryInfo ->
                     L.debug "%a: Must send infos" print t ;
@@ -508,11 +500,11 @@ struct
      * log index of the command, and we also can pull the current state of
      * the state machine with its corresponding id, waiting for id > the one that
      * have previously been returned *)
-    module Client =
+    module Clt =
     struct
         type t = { name : string ;
-                   servers : Host.t array ; (* List of all known servers *)
-                   mutable leader : Host.t (* the one believed to be good *) }
+                   servers : Server.t array ; (* List of all known servers *)
+                   mutable leader : Server.t (* the one believed to be good *) }
 
         let print fmt t =
             Printf.fprintf fmt "%20s@%s" (Log.colored true 2 "   Client") t.name
@@ -526,17 +518,17 @@ struct
             RPC_ClientServers.call ~timeout host QueryInfo (function
                 | Ok (Info info) -> k info
                 | Ok _ ->
-                    L.debug "%a: server %s answering with state not infos" print t (Host.to_string host)
+                    L.debug "%a: server %s answering with state not infos" print t (Server.to_string host)
                 | Timeout ->
-                    L.error "%a: Timeouting getinfo to %s" print t (Host.to_string host)
+                    L.error "%a: Timeouting getinfo to %s" print t (Server.to_string host)
                 | Err x ->
-                    L.error "%a: Can't get infos from %s: %s" print t (Host.to_string host) x)
+                    L.error "%a: Can't get infos from %s: %s" print t (Server.to_string host) x)
 
         let call ?(timeout=0.5) t x k =
             let max_fast_try = Array.length t.servers * 2 in
             let max_slow_try = 4 in
             let rec retry nb_fast_try nb_slow_try =
-                L.debug "%a: Sending %a to %s after %d fast, %d slow retries" print t Command.print x (Host.to_string t.leader) nb_fast_try nb_slow_try ;
+                L.debug "%a: Sending %a to %s after %d fast, %d slow retries" print t Command.print x (Server.to_string t.leader) nb_fast_try nb_slow_try ;
                 if nb_fast_try > max_fast_try then (
                     (* There might be an election going on, let's wait a little *)
                     if nb_slow_try >= max_slow_try then (
@@ -552,25 +544,25 @@ struct
                             L.debug "%a: Ack for (%d,%a)" print t log_index Command.print x ;
                             k state
                         | Ok (Redirect leader') ->
-                            L.debug "%a: Was told by %s to redirect to %s" print t (Host.to_string sent_to) (Host.to_string leader') ;
+                            L.debug "%a: Was told by %s to redirect to %s" print t (Server.to_string sent_to) (Server.to_string leader') ;
                             t.leader <-
                                 if leader' <> sent_to then leader' else
                                 (* The server do not know who is the leader yet *)
                                 if t.leader <> sent_to then t.leader else (
                                     (* And I still don't know neither: try one at random *)
                                     let l = until_diff t.leader (fun () -> random_leader t.servers) in
-                                    L.debug "%a: Will redirect to %s instead" print t (Host.to_string l) ;
+                                    L.debug "%a: Will redirect to %s instead" print t (Server.to_string l) ;
                                     l
                                 ) ;
                             retry (nb_fast_try+1) nb_slow_try
                         | Ok (Info s) ->
-                            L.debug "%a: server %s sending its status out of the blue?" print t (Host.to_string s.host) ;
+                            L.debug "%a: server %s sending its status out of the blue?" print t (Server.to_string s.host) ;
                             assert false (* TODO *)
                         | Timeout ->
-                            L.error "%a: Timeouting query %a to %s" print t Command.print x (Host.to_string sent_to) ;
+                            L.error "%a: Timeouting query %a to %s" print t Command.print x (Server.to_string sent_to) ;
                             retry (nb_fast_try+1) nb_slow_try
                         | Err x ->
-                            L.error "%a: Can't get state from %s: %s" print t (Host.to_string t.leader) x ;
+                            L.error "%a: Can't get state from %s: %s" print t (Server.to_string t.leader) x ;
                             (* try another server? *)
                             t.leader <- random_leader t.servers ;
                             retry (nb_fast_try+1) nb_slow_try)
@@ -580,13 +572,12 @@ struct
     end
 end
 
-(* FIXME:
- * Leader1 recoit command C, append_entry a tout le monde, mais pendant que cette entree se replique
- * un candidat prend la place de Leader1, qui ne peut donc submiter cette entree, et donc confirmer au
- * client. Au lieu de cela il redirige le client vers le nouveau Leader.
- * Leader2 possede l'entree C, mais elle n'a jamais ete submittee encore.
- * Le client resoumet la commande C a Leader2, qui l'accepte en nouvelle entree (on a donc alors deux
- * entrees pour la commande C a ce moment la.
- * Et les commits ne progresseront plus puisque la premiere commande C ne sera jamais repliquee completement.
- * Relire le papier!
- * *)
+(* Note:
+ * Leader1 receive from a client a request R1, append this entry and send it to every other server, but before
+ * receiving their acks it's cut from network. So it can never know it's committed and cannot ack
+ * to client.
+ * Another server become Leader2. If it has the entry then it will replicate it, if not it will be
+ * forgotten. In both case the client will not be acked nor nacked.
+ * So, if a client does not receive any answer it cannot know if the entry was committed or not.
+ * But that's to be expected: the ack can be lost.
+ *)

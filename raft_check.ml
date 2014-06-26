@@ -35,14 +35,14 @@ struct
     end
 
     let serve host others =
-        Raft_impl.Server.serve host others StateMachine.apply
+        Raft_impl.Srv.serve host others StateMachine.apply
 end
 
-module TestClient = Raft_impl.Client
+module TestClient = Raft_impl.Clt
 
 let main =
-    let nb_servers = 7 and nb_clients = 10 and nb_msgs = 1000 in
-    let servers = Array.init nb_servers (fun _ -> Host.make "localhost" (Random.int 64510 + 1024)) in
+    let nb_servers = 5 and nb_clients = 100 and nb_msgs = 100 in
+    let servers = Array.init nb_servers (fun _ -> Server.make "localhost" (Random.int 64510 + 1024)) in
     Array.iter (fun s ->
         (* peers = list of all servers but s *)
         let peers = Array.fold_left (fun lst h -> if h = s then lst else h::lst) [] servers in
