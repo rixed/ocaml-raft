@@ -37,14 +37,14 @@ struct
         type t_read = id * Types.arg
         type t_write = id * Types.ret
     end
-    module Srv_IOType = MakeIOType(BaseIOType)
-    module Srv_Pdu = Pdu.Marshaller(Srv_IOType)
-    module TcpServer = Event.TcpServer(Srv_IOType)(Srv_Pdu)
+    module Srv_IOType = MakeIOType (BaseIOType)
+    module Srv_Pdu = Pdu.Marshaller (Srv_IOType)
+    module TcpServer = Event.TcpServer (Srv_IOType) (Srv_Pdu) (struct type t = unit end)
 
     open Config
 
     let serve h f =
-        let _shutdown = TcpServer.serve ~cnx_timeout ?max_accepted (string_of_int h.Server.port) (fun write input ->
+        let _shutdown = TcpServer.serve ~cnx_timeout ?max_accepted (string_of_int h.Address.port) ignore (fun () write input ->
             match input with
             | Srv_IOType.Value (id, v) ->
                 f (fun res -> write (Srv_IOType.Write (id, res))) v
@@ -88,8 +88,8 @@ struct
             | Some w -> w
             | None ->
                 (* connect to the server *)
-                L.debug "Need a new connection to %s" (Server.to_string h) ;
-                let w = TcpClient.client ~cnx_timeout h.Server.name (string_of_int h.Server.port) (fun write input ->
+                L.debug "Need a new connection to %s" (Address.to_string h) ;
+                let w = TcpClient.client ~cnx_timeout h.Address.name (string_of_int h.Address.port) (fun write input ->
                     match input with
                     | Clt_IOType.Value (id, v) ->
                         (* Note: we can't modify continuations in place because we'd
@@ -106,7 +106,7 @@ struct
                         ()
                     | Clt_IOType.EndOfFile ->
                         (* since we don't know which messages were sent via this cnx, rely on timeout to notify continuations *)
-                        L.info "Closing cnx to %s" (Server.to_string h) ;
+                        L.info "Closing cnx to %s" (Address.to_string h) ;
                         write Close ;
                         Hashtbl.remove cnxs h) in
                 Hashtbl.add cnxs h w ;

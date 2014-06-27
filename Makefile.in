@@ -4,8 +4,8 @@ PKG_NAME = raft
 SOURCES  = \
 	log.ml \
 	pdu.ml \
-	event.ml \
 	raft_intf.ml \
+	event.ml \
 	rpc.ml \
 	raft.ml
 

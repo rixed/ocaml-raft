@@ -1,11 +1,15 @@
 (* All signatures for the whole library *)
 
-module Server =
+module Address =
 struct
     type t = { name : string ;
                port : int }
     let make name port = { name ; port }
     let to_string t = t.name ^":"^ string_of_int t.port
+    let of_sockaddr = function
+        | Unix.ADDR_UNIX _fname -> failwith "TODO"
+        | Unix.ADDR_INET (ip, port) ->
+            { name = Unix.string_of_inet_addr ip ; port }
 end
 
 module RPC =
@@ -26,12 +30,12 @@ struct
                      | Err of string
 
         (* We favor event driven programming here *)
-        val call : ?timeout:float -> Server.t -> Types.arg -> (rpc_res -> unit) -> unit
+        val call : ?timeout:float -> Address.t -> Types.arg -> (rpc_res -> unit) -> unit
         (* TODO: a call_multiple that allows several answers to be received. Useful to
          * implement pubsub *)
 
         (* TODO: add the timeout callback here so that we can call it only when the fd is empty *)
-        val serve : Server.t -> ((Types.ret -> unit) -> Types.arg -> unit) -> unit
+        val serve : Address.t -> ((Types.ret -> unit) -> Types.arg -> unit) -> unit
     end
 
     module type Maker = functor(Types : TYPES) -> (S with module Types = Types)

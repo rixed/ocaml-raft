@@ -232,11 +232,16 @@ struct
             failwith ("Cannot connect to "^ host ^":"^ service)
 end
 
-module TcpServer (T : IOType) (Pdu : PDU with type BaseIOType.t_read = T.t_read and type BaseIOType.t_write = T.t_write) :
+module TcpServer (T : IOType)
+                 (Pdu : PDU with type BaseIOType.t_read = T.t_read and type BaseIOType.t_write = T.t_write)
+                 (Clt : sig type t end) :
 sig
-    (* [serve service callback] listen on port [service] and serve each query with [callback].
+    (* [serve service new_clt callback] listen on port [service] and serve each query with [callback].
      * A shutdown function is returned that will stop the server from accepting new connections. *)
-    val serve : ?cnx_timeout:float -> ?max_accepted:int -> string -> ((T.write_cmd -> unit) -> T.read_result -> unit) -> (unit -> unit)
+    val serve : ?cnx_timeout:float -> ?max_accepted:int -> string ->
+                (Address.t -> Clt.t) ->
+                (Clt.t -> (T.write_cmd -> unit) -> T.read_result -> unit) ->
+                (unit -> unit)
 end =
 struct
     module BIO = BufferedIO (T) (Pdu)
@@ -255,7 +260,7 @@ struct
         | [] ->
             failwith ("Cannot listen to "^ service)
 
-    let serve ?cnx_timeout ?max_accepted service value_cb =
+    let serve ?cnx_timeout ?max_accepted service new_clt value_cb =
         let accepted = ref 0 in
         Option.may (fun n -> assert (n > 0)) max_accepted ;
         let listen_fd = listen service in
@@ -269,13 +274,14 @@ struct
             listen_fd :: rfiles, wfiles, efiles
         and process_files _handler (rfiles, _, _) =
             if List.mem listen_fd rfiles then (
-                let client_fd, _sock_addr = Unix.accept listen_fd in
+                let client_fd, sockaddr = Unix.accept listen_fd in
                 L.info "Accepting new cnx %a" Log.file client_fd ;
                 incr accepted ;
                 (match max_accepted with
                     | Some n when !accepted >= n -> stop_listening ()
                     | _ -> ()) ;
-                let _buf_writer = BIO.start ?cnx_timeout client_fd client_fd value_cb in
+                let clt = new_clt (Address.of_sockaddr sockaddr) in
+                let _buf_writer = BIO.start ?cnx_timeout client_fd client_fd (value_cb clt) in
                 ()
             )
         and handler = { register_files ; process_files } in

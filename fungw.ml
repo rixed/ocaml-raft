@@ -108,7 +108,21 @@ end
 module Link =
 struct
     module IOType = MakeIOType(Pdu.AllStrings)
-    module TcpServer = Event.TcpServer (IOType) (Pdu.Blobber)
+    module Clt =
+    struct
+        type queue =
+            { q : IOType.write_cmd Queue.t ;
+              mutable writer : (IOType.write_cmd -> unit) option }
+        let make_queue () =
+            { q = Queue.create () ;
+              writer = None }
+        type t =
+            { address : Address.t ;
+              queues : queue * queue ;
+              mutable condition : Condition.t * Condition.t ;
+              mutable closed : bool }
+    end
+    module TcpServer = Event.TcpServer (IOType) (Pdu.Blobber) (Clt)
     module TcpClient = Event.TcpClient (IOType) (Pdu.Blobber)
 
     type t =
@@ -116,20 +130,52 @@ struct
          * and 'in' the direction from server to client, ie. we adopt
          * the client perspective. *)
         { listen_to : string ;
-          forward_to : Server.t ;
+          forward_to : Address.t ;
           mutable config : Config.t * Config.t (* in, out *) ;
-          mutable condition : Condition.t * Condition.t ;
-          mutable queue : IOType.write_cmd Queue.t * IOType.write_cmd Queue.t (* next things to write *) }
+          mutable clients : Clt.t list }
 
     let print fmt t =
-        Format.fprintf fmt "%s:%s:%d" t.listen_to t.forward_to.Server.name t.forward_to.Server.port
+        Format.fprintf fmt "%s:%s:%d" t.listen_to t.forward_to.Address.name t.forward_to.Address.port
+
+    type which = { f : 'a. 'a * 'a -> 'a }
+    let w_fst = { f = fst }
+    let w_snd = { f = snd }
+    let rec delay_send name clt which =
+        let queue = which.f clt.Clt.queues and cond = which.f clt.Clt.condition in
+        (match queue.Clt.writer with
+        | None -> ()
+        | Some writer ->
+            if not (Queue.is_empty queue.q) then (
+                let x = Queue.take queue.q in
+                L.debug "%s: Writing %s..." name (match x with IOType.Close -> "FIN" | IOType.Write _ -> "a string") ;
+                writer x ;
+                if x = IOType.Close then clt.closed <- true
+            )) ;
+        if not clt.closed then (
+            let open Condition in
+            let d = Random.float cond.lag.chance in
+            L.debug "%s: rescheduling in %gs" name d ;
+            Event.pause d (fun () -> delay_send name clt which)
+        )
+
+    let make_client t address =
+        let open Clt in
+        L.debug "New client: %s" (Address.to_string address) ;
+        let client =
+            { address = address ;
+              queues = make_queue (), make_queue () ;
+              condition = Condition.make (fst t.config), Condition.make (snd t.config) ;
+              closed = false } in
+        t.clients <- client::t.clients ;
+        delay_send "in"  client w_fst ;
+        delay_send "out" client w_snd ;
+        client
 
     let make listen_to host_name host_port =
         { listen_to ;
-          forward_to = Server.make host_name (int_of_string host_port) ;
+          forward_to = Address.make host_name (int_of_string host_port) ;
           config = Config.make_ok (), Config.make_ok () ;
-          condition = Condition.make_ok (), Condition.make_ok () ;
-          queue = Queue.create (), Queue.create () }
+          clients = [] }
 
     (* String format is similar to ssh port redirection format:
      * listen_to:remote_server:remote_port
@@ -144,47 +190,30 @@ struct
             invalid_arg str
 
     let start ?cnx_timeout t =
-        let client_writer_started = ref false in
-        let continue = ref true in
-        let rec delay_send name w q conf =
-            if not (Queue.is_empty q) then (
-                let x = Queue.take q in
-                L.debug "%s: Writing %s..." name (match x with IOType.Close -> "FIN" | IOType.Write _ -> "a string") ;
-                w x ;
-                if x = IOType.Close then continue := false
-            ) ;
-            if !continue then (
-                let open Config in
-                let d = Random.float (conf.lag.max -. conf.lag.min) +. conf.lag.min in
-                L.debug "%s: rescheduling in %gs" name d ;
-                Event.pause d (fun () -> delay_send name w q conf)
-            ) in
-        let server_to_client _to_server = function
+        let server_to_client clt _writer = function
             | IOType.Value str ->
-                Queue.add (IOType.Write str) (fst t.queue)
+                Queue.add (IOType.Write str) (fst clt.Clt.queues).q
             | IOType.Timeout _now -> ()
             | IOType.EndOfFile ->
-                L.info "IN: FIN" ;
-                Queue.add IOType.Close (fst t.queue) in
-        let to_server =
-            TcpClient.client ?cnx_timeout t.forward_to.name (string_of_int t.forward_to.port) server_to_client in
-        let client_to_server writer v =
+                Queue.add IOType.Close (fst clt.Clt.queues).q in
+        let client_to_server clt to_client v =
             (* We can't know the to_client writer before some client actually connect
-             * (note: we allow only one). So we save it here. *)
-            if not !client_writer_started then (
-                L.debug "Initializing client writer" ;
-                client_writer_started := true ;
-                delay_send "in" writer (fst t.queue) (fst t.config)
-            ) ;
+             * So we save it now. *)
+            (match (fst clt.Clt.queues).Clt.writer with
+            | Some _ -> ()
+            | None ->
+                (fst clt.Clt.queues).Clt.writer <- Some to_client ;
+                (* Now start a new connection to the server for this client *)
+                let to_server =
+                    TcpClient.client ?cnx_timeout t.forward_to.name (string_of_int t.forward_to.port) (server_to_client clt) in
+                (snd clt.queues).Clt.writer <- Some to_server) ;
             match v with
             | IOType.Value str ->
-                Queue.add (IOType.Write str) (snd t.queue)
+                Queue.add (IOType.Write str) (snd clt.Clt.queues).q
             | IOType.Timeout _now -> ()
             | IOType.EndOfFile ->
-                L.info "OUT: FIN" ;
-                Queue.add IOType.Close (snd t.queue) in
-        let shutdown = TcpServer.serve ?cnx_timeout ~max_accepted:1 t.listen_to client_to_server in
-        delay_send "out" to_server (snd t.queue) (snd t.config) ;
+                Queue.add IOType.Close (snd clt.Clt.queues).q in
+        let shutdown = TcpServer.serve ?cnx_timeout t.listen_to (make_client t) client_to_server in
         shutdown
 end
 
@@ -214,7 +243,6 @@ let () =
     let start_all link lag loss fuzzing =
         let config = Config.make lag loss fuzzing in
         link.Link.config <- config, config ;
-        link.Link.condition <- Condition.make config, Condition.make config ;
         let links = [link] in
         List.map Link.start links in
     match Term.(eval (pure start_all $ links $ lag $ loss $ fuzzing, info "Forward TCP traffic")) with
