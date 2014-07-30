@@ -2,16 +2,11 @@ top_srcdir = @top_srcdir@
 
 PKG_NAME = raft
 SOURCES  = \
-	log.ml \
-	pdu.ml \
-	raft_intf.ml \
-	event.ml \
-	rpc.ml \
 	raft.ml
 
-EXAMPLES_BYTE = fungw.byte
+EXAMPLES_BYTE =
 
-REQUIRES = batteries oUnit cmdliner
+REQUIRES = ropic batteries oUnit cmdliner
 
 EXAMPLES_OPT = $(EXAMPLES_BYTE:.byte=.opt)
 EXAMPLES = $(EXAMPLES_BYTE) $(EXAMPLES_OPT)
@@ -34,8 +29,7 @@ raft.top: $(ARCHIVE)
 run: raft.top
 	rlwrap ./raft.top -init raft.init
 
-TEST_PROGRAMS = check.ml raft_check.ml
-check.cmo: $(ARCHIVE)
+TEST_PROGRAMS = raft_check.ml
 raft_check.cmo: $(ARCHIVE)
 check-spec: $(TEST_PROGRAMS:.ml=.opt)
 	@for p in $^ ; do \
@@ -48,6 +42,8 @@ stress: raft_check.opt check_output.opt
 clean-spec:
 
 dep-spec:
+
+install-spec:
 
 loc:
 	@ls *.ml *.mli -1 | xargs cat | wc -l

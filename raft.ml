@@ -1,5 +1,5 @@
 open Batteries
-open Raft_intf
+open Ropic
 
 module L = Log.Debug
 

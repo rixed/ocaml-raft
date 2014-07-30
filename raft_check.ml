@@ -13,7 +13,7 @@
  *    and protect against drop/fuzzing next.
  *)
 open Batteries
-open Raft_intf
+open Ropic
 
 module Command =
 struct
@@ -42,7 +42,7 @@ module TestClient = Raft_impl.Clt
 
 let main =
     let nb_servers = 5 and nb_clients = 100 and nb_msgs = 100 in
-    let servers = Array.init nb_servers (fun _ -> Server.make "localhost" (Random.int 64510 + 1024)) in
+    let servers = Array.init nb_servers (fun _ -> Address.make "localhost" (Random.int 64510 + 1024)) in
     Array.iter (fun s ->
         (* peers = list of all servers but s *)
         let peers = Array.fold_left (fun lst h -> if h = s then lst else h::lst) [] servers in

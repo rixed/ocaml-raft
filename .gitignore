@@ -17,6 +17,5 @@ nohup.out
 all_tests.ml
 /Makefile
 /make.common
-/configure
 /config.status
 autom4te.cache
